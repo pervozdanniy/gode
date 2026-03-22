@@ -102,6 +102,10 @@ bool HandleBase::IsDereferenceAllowed() const {
   // epilogue callbacks in the safepoint after a GC.
   if (AllowHandleUsageOnAllThreads::IsAllowed()) return true;
 
+  // GOROUTINE PATCH: Allow handle deref from M-threads
+  // v8_goroutine_thread declared in goroutine-thread.h (global scope, included via isolate.h)
+  if (v8_goroutine_thread) return true;
+
   LocalHeap* local_heap = isolate->CurrentLocalHeap();
 
   // Local heap can't access handles when parked
@@ -144,6 +148,9 @@ bool DirectHandleBase::IsDereferenceAllowed() const {
   // Deref is explicitly allowed from any thread. Used for running internal GC
   // epilogue callbacks in the safepoint after a GC.
   if (AllowHandleUsageOnAllThreads::IsAllowed()) return true;
+
+  // GOROUTINE PATCH: Allow handle deref from M-threads
+  if (v8_goroutine_thread) return true;
 
   LocalHeap* local_heap = isolate->CurrentLocalHeap();
 

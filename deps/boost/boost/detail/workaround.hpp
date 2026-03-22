@@ -1,0 +1,4 @@
+#ifndef BOOST_DETAIL_WORKAROUND_HPP
+#define BOOST_DETAIL_WORKAROUND_HPP
+#define BOOST_WORKAROUND(symbol, test) 0
+#endif

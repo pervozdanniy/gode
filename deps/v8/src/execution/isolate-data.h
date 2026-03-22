@@ -544,6 +544,7 @@ class IsolateData final {
 
   friend class Isolate;
   friend class Heap;
+  friend class GoroutineThreadState;
   FRIEND_TEST(HeapTest, ExternalLimitDefault);
   FRIEND_TEST(HeapTest, ExternalLimitStaysAboveDefaultForExplicitHandling);
 };

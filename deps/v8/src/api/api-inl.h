@@ -170,22 +170,42 @@ class V8_NODISCARD CallDepthScope {
  public:
   CallDepthScope(i::Isolate* isolate, Local<Context> context)
       : isolate_(isolate), saved_context_(isolate->context(), isolate_) {
+    // GOROUTINE PATCH: Check if we're in M-thread.
+    // Per-thread IsolateData makes ThreadLocalTop operations safe.
+    // But Fire*Callback and microtask processing touch shared Isolate state,
+    // so we skip those for M-threads.
+    // v8_goroutine_thread declared in goroutine-thread.h (global scope, included via isolate.h)
+    is_goroutine_thread_ = v8_goroutine_thread;
+
     isolate_->thread_local_top()->IncrementCallDepth<do_callback>(this);
+
     i::Tagged<i::NativeContext> env = *Utils::OpenDirectHandle(*context);
     isolate->set_context(env);
 
-    if (do_callback) isolate_->FireBeforeCallEnteredCallback();
+    if (do_callback && !is_goroutine_thread_) {
+      isolate_->FireBeforeCallEnteredCallback();
+    }
   }
   ~CallDepthScope() {
+    if (is_goroutine_thread_) {
+      // For M-threads: decrement call depth and restore context,
+      // but skip callbacks and microtask processing (shared state).
+      isolate_->thread_local_top()->DecrementCallDepth(this);
+      if (isolate_->thread_local_top()->CallDepthIsZero() &&
+          (isolate_->thread_local_top()->try_catch_handler_ == nullptr ||
+           !isolate_->is_execution_terminating())) {
+        isolate_->clear_internal_exception();
+      }
+      isolate_->set_context(*saved_context_);
+      return;
+    }
+
+    // Default V8 behavior for non-goroutine threads:
     i::MicrotaskQueue* microtask_queue =
         i::Cast<i::NativeContext>(isolate_->context())
             ->microtask_queue(isolate_);
 
     isolate_->thread_local_top()->DecrementCallDepth(this);
-    // Clear the exception when exiting V8 to avoid memory leaks.
-    // Also clear termination exceptions iff there's no TryCatch handler.
-    // TODO(verwaest): Drop this once we propagate exceptions to external
-    // TryCatch on Throw. This should be debug-only.
     if (isolate_->thread_local_top()->CallDepthIsZero() &&
         (isolate_->thread_local_top()->try_catch_handler_ == nullptr ||
          !isolate_->is_execution_terminating())) {
@@ -225,6 +245,9 @@ class V8_NODISCARD CallDepthScope {
 
   i::Isolate* const isolate_;
   i::Handle<i::Context> saved_context_;
+
+  // GOROUTINE PATCH: Track if we're in M-thread
+  bool is_goroutine_thread_ = false;
 
   i::Address previous_stack_height_;
 

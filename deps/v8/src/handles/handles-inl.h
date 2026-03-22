@@ -276,7 +276,10 @@ HandleType<T> HandleScope::CloseAndEscape(HandleType<T> handle_value) {
 Address* HandleScope::CreateHandle(Isolate* isolate, Address value) {
   DCHECK(AllowHandleAllocation::IsAllowed());
 #ifdef DEBUG
-  if (!AllowHandleUsageOnAllThreads::IsAllowed()) {
+  // GOROUTINE PATCH: Skip thread-id check for M-threads (they have per-thread
+  // HandleScopeData so handle creation is safe)
+  // v8_goroutine_thread declared in goroutine-thread.h (global scope, included via isolate.h)
+  if (!v8_goroutine_thread && !AllowHandleUsageOnAllThreads::IsAllowed()) {
     DCHECK(isolate->main_thread_local_heap()->IsRunning());
     DCHECK_WITH_MSG(
         isolate->thread_id() == ThreadId::Current(),

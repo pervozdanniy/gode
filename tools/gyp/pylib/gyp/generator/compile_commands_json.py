@@ -15,7 +15,8 @@ generator_filelist_paths = None
 generator_supports_multiple_toolsets = True
 generator_wants_sorted_dependencies = False
 
-# Lifted from make.py.  The actual values don't matter much.
+# Default variables.  These are substituted by gyp into .gyp paths, so they
+# must resolve to real filesystem paths (not make/shell variables).
 generator_default_variables = {
     "CONFIGURATION_NAME": "$(BUILDTYPE)",
     "EXECUTABLE_PREFIX": "",
@@ -61,12 +62,27 @@ def AddCommandsForTarget(cwd, target, params, per_config_commands):
         defines = configuration.get("defines", [])
         defines = ["-D" + s for s in defines]
 
-        # TODO(bnoordhuis) Handle generated source files.
+        # Resolve gyp/make variables to real paths.
+        abs_build_dir = os.path.abspath(
+            os.path.join(output_dir, configuration_name)
+        )
+        obj_dir = os.path.join(abs_build_dir, "obj")
+
+        def _resolve_vars(p):
+            # Longer patterns first to avoid partial matches.
+            p = p.replace("$(obj).target", os.path.join(abs_build_dir, "obj.target"))
+            p = p.replace("$(obj).host", os.path.join(abs_build_dir, "obj.host"))
+            p = p.replace("$(obj)", obj_dir)
+            p = p.replace("$(builddir)", abs_build_dir)
+            p = p.replace("$(BUILDTYPE)", configuration_name)
+            p = p.replace("$(TOOLSET)", "target")
+            return p
+
         extensions = (".c", ".cc", ".cpp", ".cxx")
         sources = [s for s in target.get("sources", []) if s.endswith(extensions)]
 
         def resolve(filename):
-            return os.path.abspath(os.path.join(cwd, filename))
+            return os.path.abspath(os.path.join(cwd, _resolve_vars(filename)))
 
         # TODO(bnoordhuis) Handle generated header files.
         include_dirs = configuration.get("include_dirs", [])

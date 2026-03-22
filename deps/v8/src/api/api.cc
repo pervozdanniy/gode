@@ -698,11 +698,19 @@ void HandleScope::Initialize(Isolate* v8_isolate) {
   // almost nothing, so it is enough to check in this central place.
   // We make an exception if the serializer is enabled, which means that the
   // Isolate is exclusively used to create a snapshot.
-  Utils::ApiCheck(!i_isolate->was_locker_ever_used() ||
-                      i_isolate->thread_manager()->IsLockedByCurrentThread() ||
-                      i_isolate->serializer_enabled(),
-                  "HandleScope::HandleScope",
-                  "Entering the V8 API without proper locking in place");
+
+  // GOROUTINE PATCH: Skip Locker check for M-threads (they use per-thread
+  // IsolateData so concurrent API access is safe). Default behavior preserved
+  // for all other threads.
+  // v8_goroutine_thread declared in goroutine-thread.h (global scope, included via isolate.h)
+  if (!v8_goroutine_thread) {
+    Utils::ApiCheck(!i_isolate->was_locker_ever_used() ||
+                        i_isolate->thread_manager()->IsLockedByCurrentThread() ||
+                        i_isolate->serializer_enabled(),
+                    "HandleScope::HandleScope",
+                    "Entering the V8 API without proper locking in place");
+  }
+
   i::HandleScopeData* current = i_isolate->handle_scope_data();
   i_isolate_ = i_isolate;
   prev_next_ = current->next;
@@ -5339,18 +5347,41 @@ base::Vector<i::DirectHandle<i::Object>> PrepareArguments(int argc,
 MaybeLocal<Value> Object::CallAsFunction(Local<Context> context,
                                          Local<Value> recv, int argc,
                                          Local<Value> argv[]) {
+  fprintf(stderr, "[V8 API] Object::CallAsFunction started\n");
+  fflush(stderr);
+
   auto i_isolate = reinterpret_cast<i::Isolate*>(context->GetIsolate());
+
+  fprintf(stderr, "[V8 API] Got i_isolate=%p\n", i_isolate);
+  fflush(stderr);
+
   TRACE_EVENT_CALL_STATS_SCOPED(i_isolate, "v8", "V8.Execute");
+
+  fprintf(stderr, "[V8 API] Before ENTER_V8\n");
+  fflush(stderr);
+
   ENTER_V8(i_isolate, context, Object, CallAsFunction, InternalEscapableScope);
+
+  fprintf(stderr, "[V8 API] After ENTER_V8\n");
+  fflush(stderr);
+
   i::TimerEventScope<i::TimerEventExecute> timer_scope(i_isolate);
   i::NestedTimedHistogramScope execute_timer(i_isolate->counters()->execute(),
                                              i_isolate);
   auto self = Utils::OpenDirectHandle(this);
   auto recv_obj = Utils::OpenDirectHandle(*recv);
   auto args = PrepareArguments(argc, argv);
+
+  fprintf(stderr, "[V8 API] Calling Execution::Call...\n");
+  fflush(stderr);
+
   Local<Value> result;
   has_exception = !ToLocal<Value>(
       i::Execution::Call(i_isolate, self, recv_obj, args), &result);
+
+  fprintf(stderr, "[V8 API] After Execution::Call, has_exception=%d\n", has_exception);
+  fflush(stderr);
+
   RETURN_ON_FAILED_EXECUTION(Value);
   RETURN_ESCAPED(result);
 }
@@ -5429,9 +5460,26 @@ MaybeLocal<v8::Value> Function::Call(v8::Isolate* isolate,
                                      Local<Context> context,
                                      v8::Local<v8::Value> recv, int argc,
                                      v8::Local<v8::Value> argv[]) {
+  fprintf(stderr, "[V8 API] ========== Function::Call started (argc=%d) ==========\n", argc);
+  fflush(stderr);
+
+  fprintf(stderr, "[V8 API] Function::Call: this=%p, isolate=%p, recv=%p\n", this, isolate, *recv);
+  fflush(stderr);
+
   auto i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+
+  fprintf(stderr, "[V8 API] Function::Call: About to TRACE_EVENT_CALL_STATS_SCOPED (i_isolate=%p)...\n", i_isolate);
+  fflush(stderr);
+
   TRACE_EVENT_CALL_STATS_SCOPED(i_isolate, "v8", "V8.Execute");
+  fprintf(stderr, "[V8 API] Function::Call: About to ENTER_V8...\n");
+  fflush(stderr);
+
   ENTER_V8(i_isolate, context, Function, Call, InternalEscapableScope);
+
+  fprintf(stderr, "[V8 API] Entered V8 successfully\n");
+  fflush(stderr);
+
   i::TimerEventScope<i::TimerEventExecute> timer_scope(i_isolate);
   i::NestedTimedHistogramScope execute_timer(i_isolate->counters()->execute(),
                                              i_isolate);
@@ -5440,9 +5488,17 @@ MaybeLocal<v8::Value> Function::Call(v8::Isolate* isolate,
                   "Function to be called is a null pointer");
   auto recv_obj = Utils::OpenDirectHandle(*recv);
   auto args = PrepareArguments(argc, argv);
+
+  fprintf(stderr, "[V8 API] Calling i::Execution::Call...\n");
+  fflush(stderr);
+
   Local<Value> result;
   has_exception = !ToLocal<Value>(
       i::Execution::Call(i_isolate, self, recv_obj, args), &result);
+
+  fprintf(stderr, "[V8 API] Execution::Call returned, has_exception=%d\n", has_exception);
+  fflush(stderr);
+
   RETURN_ON_FAILED_EXECUTION(Value);
   RETURN_ESCAPED(result);
 }

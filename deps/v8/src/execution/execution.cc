@@ -4,6 +4,8 @@
 
 #include "src/execution/execution.h"
 
+#include <cstdio>  // For goroutine debug logging
+
 #include "src/api/api-inl.h"
 #include "src/debug/debug.h"
 #include "src/execution/frames.h"
@@ -358,9 +360,16 @@ V8_WARN_UNUSED_RESULT MaybeHandle<Object> Invoke(Isolate* isolate,
 
   // Entering JavaScript.
   VMState<JS> state(isolate);
-  if (!AllowJavascriptExecution::IsAllowed(isolate)) {
-    GRACEFUL_FATAL("Invoke in DisallowJavascriptExecutionScope");
+
+  // GOROUTINE PATCH: Skip AllowJavascriptExecution check for M-threads.
+  // Default behavior preserved for all other threads.
+  // v8_goroutine_thread declared in goroutine-thread.h (global scope)
+  if (!v8_goroutine_thread) {
+    if (!AllowJavascriptExecution::IsAllowed(isolate)) {
+      GRACEFUL_FATAL("Invoke in DisallowJavascriptExecutionScope");
+    }
   }
+
   if (!ThrowOnJavascriptExecution::IsAllowed(isolate)) {
     isolate->ThrowIllegalOperation();
     isolate->ReportPendingMessages(params.message_handling ==

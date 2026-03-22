@@ -28,6 +28,8 @@
 #include "src/common/ptr-compr.h"
 #include "src/common/thread-local-storage.h"
 #include "src/debug/interface-types.h"
+#include "src/execution/goroutine-thread.h"
+#include "src/execution/goroutine-thread-state.h"
 #include "src/execution/execution.h"
 #include "src/execution/futex-emulation.h"
 #include "src/execution/isolate-data.h"
@@ -1210,8 +1212,23 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
                                       OFFSET_OF(Isolate, heap_));
   }
 
-  const IsolateData* isolate_data() const { return &isolate_data_; }
-  IsolateData* isolate_data() { return &isolate_data_; }
+  const IsolateData* isolate_data() const {
+    // GOROUTINE PATCH: Per-thread IsolateData for M-threads.
+    // This makes isolate_root(), thread_local_top(), handle_scope_data(),
+    // stack_guard(), roots_table() etc. all per-thread automatically.
+    if (v8_goroutine_thread) {
+      IsolateData* per_thread = GoroutineThreadState::GetIsolateData();
+      if (per_thread) return per_thread;
+    }
+    return &isolate_data_;
+  }
+  IsolateData* isolate_data() {
+    if (v8_goroutine_thread) {
+      IsolateData* per_thread = GoroutineThreadState::GetIsolateData();
+      if (per_thread) return per_thread;
+    }
+    return &isolate_data_;
+  }
 
   // When pointer compression is on, this is the base address of the pointer
   // compression cage, and the kPtrComprCageBaseRegister is set to this
@@ -1335,10 +1352,10 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   }
   void InitializeThreadLocal();
   ThreadLocalTop* thread_local_top() {
-    return &isolate_data_.thread_local_top_;
+    return &isolate_data()->thread_local_top();
   }
   ThreadLocalTop const* thread_local_top() const {
-    return &isolate_data_.thread_local_top_;
+    return &isolate_data()->thread_local_top();
   }
 
   static constexpr uint32_t thread_in_wasm_flag_address_offset() {
@@ -1382,7 +1399,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
                                  isolate_root_bias());
   }
 
-  uint8_t error_message_param() { return isolate_data_.error_message_param_; }
+  uint8_t error_message_param() { return isolate_data()->error_message_param_; }
 
   THREAD_LOCAL_TOP_ADDRESS(Address, thread_in_wasm_flag_address)
 
@@ -1397,10 +1414,16 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   }
 
   V8_INLINE HandleScopeData* handle_scope_data() {
-    return &isolate_data_.handle_scope_data_;
+    return &isolate_data()->handle_scope_data_;
   }
 
   HandleScopeImplementer* handle_scope_implementer() const {
+    // GOROUTINE PATCH: Return per-thread implementer for M-threads
+    if (v8_goroutine_thread) {
+      HandleScopeImplementer* impl =
+          GoroutineThreadState::GetHandleScopeImplementer();
+      if (impl) return impl;
+    }
     DCHECK(handle_scope_implementer_);
     return handle_scope_implementer_;
   }

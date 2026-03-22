@@ -281,6 +281,7 @@ class V8_EXPORT_PRIVATE V8_NODISCARD StackGuard final {
   friend class Isolate;
   friend class StackLimitCheck;
   friend class InterruptsScope;
+  friend class GoroutineThreadState;
 
   static_assert(std::is_standard_layout<ThreadLocal>::value);
 };

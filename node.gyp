@@ -162,6 +162,14 @@
       'src/node_worker.cc',
       'src/node_zlib.cc',
       'src/path.cc',
+      # Goroutine support
+      'src/goroutine_wrap.cc',
+      'src/goroutine/g.cc',
+      'src/goroutine/stack.cc',
+      'src/goroutine/context.cc',
+      'src/goroutine/scheduler.cc',
+      'src/goroutine/runtime.cc',
+      'src/goroutine/channel.cc',
       'src/permission/child_process_permission.cc',
       'src/permission/fs_permission.cc',
       'src/permission/inspector_permission.cc',
@@ -863,11 +871,13 @@
       'include_dirs': [
         'src',
         'deps/postject',
+        'deps/boost',  # Boost.Context for goroutines
         '<(SHARED_INTERMEDIATE_DIR)' # for node_natives.h
       ],
       'dependencies': [
         'tools/v8_gypfiles/abseil.gyp:abseil',
         'node_js2c#host',
+        'deps/boost/boost.gyp:boost_context',  # Boost.Context for goroutines
       ],
 
       'sources': [
