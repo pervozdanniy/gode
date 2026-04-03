@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "src/execution/isolate.h"
+#include "src/execution/goroutine-thread.h"  // GOROUTINE PATCH
 
 #include <stdlib.h>
 
@@ -5937,7 +5938,6 @@ void Isolate::Enter() {
 #ifdef V8_ENABLE_CHECKS
   // GOROUTINE PATCH: Allow multiple M-threads to enter the same isolate.
   // Only enforce thread checks for non-goroutine threads.
-  extern thread_local bool v8_goroutine_thread;
   if (!v8_goroutine_thread) {
     ThreadId thread_id = ThreadId::Current();
     if (current_thread_id_.IsValid()) {
@@ -5980,7 +5980,12 @@ void Isolate::Enter() {
   SetIsolateThreadLocals(this, data);
 
   // In case it's the first time some thread enters the isolate.
-  set_thread_id(data->thread_id());
+  // GOROUTINE PATCH: Worker M-threads must not overwrite the main thread's
+  // thread_id_ in the shared ThreadLocalTop (causes DCHECK failure in
+  // HandleScope::CreateHandle on the main thread).
+  if (!v8_goroutine_thread) {
+    set_thread_id(data->thread_id());
+  }
 }
 
 void Isolate::Exit() {
@@ -5992,7 +5997,6 @@ void Isolate::Exit() {
 
 #ifdef V8_ENABLE_CHECKS
   // GOROUTINE PATCH: Skip thread checks for M-threads
-  extern thread_local bool v8_goroutine_thread;
   if (!v8_goroutine_thread) {
     CHECK_EQ(current_thread_id_, ThreadId::Current());
     if (--current_thread_counter_ == 0) current_thread_id_ = ThreadId::Invalid();

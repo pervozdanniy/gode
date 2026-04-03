@@ -4,12 +4,13 @@
 Форк Node.js с настоящими горутинами à la Go.  JS-функции запускаются через
 `go(fn, ...args)` и исполняются конкурентно по модели GMP (Goroutine / Machine / Processor).
 
-## Текущий статус — ✅ Phase 2 работает
+## Текущий статус — ✅ Phase 2 работает (Debug + Release)
 Worker M-threads запускают горутины на отдельных OS-потоках.
 V8 mutex сериализует доступ к V8: M0 отпускает в `uv_prepare` (перед epoll),
 worker Ms подхватывают, M0 забирает обратно в `uv_check`.
 Per-G HandleScopeData save/restore изолирует handle scopes между горутинами.
-Все тесты проходят с GOMAXPROCS=1 и GOMAXPROCS=2.
+Debug build: V8 DCHECKs пофиксены (set_thread_id skip для goroutine threads).
+Все тесты проходят с GOMAXPROCS=1, 2, 4 на Debug и Release.
 
 ---
 
@@ -129,17 +130,45 @@ deps/v8/src/execution/goroutine-thread-state.h/.cc — Per-P V8 state
 deps/boost/                                        — Boost.Context (fcontext asm)
 ```
 
-## Сборка и тест
-```bash
-# Сборка (из out/Release)
-ninja -j$(nproc)
+## Тесты
 
-# Тест
-./out/Release/node test_ultra_minimal.js          # с debug stderr
-./out/Release/node test_ultra_minimal.js 2>/dev/null  # чисто
+Горутинные тесты живут в отдельном сьюте `test/goroutine/` (автообнаружение через `testcfg.py`).
+
+```
+test/goroutine/
+  testcfg.py                  — SimpleTestConfiguration (sequential)
+  test-goroutine-basic.js     — go(), goid(), args, unique IDs
+  test-goroutine-goid.js      — goid() inside goroutine > 0
+  test-goroutine-many.js      — 100 goroutines complete without crash
+  test-goroutine-console.js   — console.log works from goroutine
+  test-goroutine-heap.js      — heap allocation (strings, arrays, objects)
+```
+
+```bash
+# Запуск всех goroutine-тестов:
+python3 tools/test.py --mode=release goroutine
+python3 tools/test.py --mode=debug goroutine
+
+# Запуск конкретного теста напрямую:
+./out/Release/node test/goroutine/test-goroutine-basic.js
+NODE_GOMAXPROCS=4 ./out/Release/node test/goroutine/test-goroutine-many.js
+```
+
+## Сборка
+```bash
+# === Release ===
+cd out/Release && ninja -j$(nproc)
+./out/Release/node test_ultra_minimal.js
+
+# === Debug (с V8 DCHECKs, символами, без оптимизаций) ===
+cd out/Debug && ninja -j$(nproc)
+./out/Debug/node test_ultra_minimal.js
+
+# Отладка
+gdb --args ./out/Debug/node test_ultra_minimal.js
 
 # С переменной окружения
-NODE_GOMAXPROCS=1 ./out/Release/node test_ultra_minimal.js
+NODE_GOMAXPROCS=1 ./out/Debug/node test_ultra_minimal.js
 ```
 
 ## Ключевые решения

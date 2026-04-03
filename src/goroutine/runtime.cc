@@ -56,10 +56,12 @@ void M::ThreadLoop() {
   Runtime* rt = runtime_;
   v8::Isolate* isolate = rt->isolate();
 
+  // Activate V8 goroutine-thread patches BEFORE Enter() so that
+  // isolate_data() redirects to per-thread data and Enter() doesn't
+  // overwrite the main thread's thread_id_ in shared IsolateData.
+  v8_goroutine_thread = true;
   // Register this OS thread with V8.
   isolate->Enter();
-  // Activate V8 goroutine-thread patches (skip Locker checks, etc.).
-  v8_goroutine_thread = true;
 
   while (running_.load()) {
     // Sleep until a goroutine is available.
