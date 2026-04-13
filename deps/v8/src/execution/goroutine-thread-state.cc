@@ -1,5 +1,6 @@
-// Goroutine per-P V8 state implementation.
+// Goroutine per-M V8 state implementation.
 // See goroutine-thread-state.h for architecture overview.
+// GM model: V8 state belongs to M (thread) directly, no P abstraction.
 
 #include "src/execution/goroutine-thread-state.h"
 
@@ -13,14 +14,13 @@
 #include "src/codegen/compiler.h"
 #include "src/objects/js-function-inl.h"
 
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 namespace v8 {
 namespace internal {
 
-// Thread-local: pointer to the ACTIVE P's state on this M-thread.
+// Thread-local: pointer to the ACTIVE M's V8 state on this thread.
 static thread_local GoroutinePState* g_active_p_state = nullptr;
 
 // ---- Accessors (called from patched V8 code) ----
@@ -37,23 +37,18 @@ bool GoroutineThreadState::IsActive() {
   return g_active_p_state != nullptr;
 }
 
-// ---- P-state lifecycle ----
+// ---- Per-M state lifecycle ----
 
 GoroutinePState* GoroutineThreadState::CreatePState(Isolate* isolate) {
   // Called on main thread. isolate->isolate_data() returns the real main data.
   IsolateData* main_data = isolate->isolate_data();
   Tagged<Context> main_ctx = main_data->thread_local_top().context_;
 
-  fprintf(stderr, "[PState] Creating per-P V8 state (IsolateData size=%zu)\n",
-          sizeof(IsolateData));
-  fflush(stderr);
-
-  // Allocate per-P IsolateData (aligned).
+  // Allocate per-M IsolateData (aligned).
   constexpr size_t kAlign = alignof(IsolateData);
   constexpr size_t kSize = (sizeof(IsolateData) + kAlign - 1) & ~(kAlign - 1);
   void* raw = std::aligned_alloc(kAlign, kSize);
   if (!raw) {
-    fprintf(stderr, "[PState] FATAL: aligned_alloc failed\n");
     std::abort();
   }
 
@@ -68,11 +63,11 @@ GoroutinePState* GoroutineThreadState::CreatePState(Isolate* isolate) {
   p_data->handle_scope_data_.Initialize();
 
   // Allocation LABs: reset to force slow-path for now.
-  // TODO: Per-P LAB chunks from Heap (Go mcache equivalent).
+  // TODO: Per-M LAB chunks from Heap.
   p_data->new_allocation_info_.Reset(kNullAddress, kNullAddress);
   p_data->old_allocation_info_.Reset(kNullAddress, kNullAddress);
 
-  // HandleScopeImplementer: per-P instance.
+  // HandleScopeImplementer: per-M instance.
   HandleScopeImplementer* hsi = new HandleScopeImplementer(isolate);
 
   if (!main_ctx.is_null() && main_ctx.ptr() != kNullAddress) {
@@ -80,21 +75,11 @@ GoroutinePState* GoroutineThreadState::CreatePState(Isolate* isolate) {
     hsi->EnterContext(native_ctx);
   }
 
-  GoroutinePState* state = new GoroutinePState{p_data, hsi};
-
-  fprintf(stderr, "[PState] Created: IsolateData=%p, main=%p\n",
-          static_cast<void*>(p_data), static_cast<void*>(main_data));
-  fflush(stderr);
-
-  return state;
+  return new GoroutinePState{p_data, hsi};
 }
 
 void GoroutineThreadState::DestroyPState(GoroutinePState* state) {
   if (!state) return;
-  fprintf(stderr, "[PState] Destroying per-P state (IsolateData=%p)\n",
-          static_cast<void*>(state->isolate_data));
-  fflush(stderr);
-
   std::free(state->isolate_data);
   delete state->handle_scope_impl;
   delete state;
@@ -114,17 +99,9 @@ void GoroutineThreadState::ActivatePState(GoroutinePState* state) {
   sg->thread_local_.real_climit_ = stack_limit;
   sg->thread_local_.set_climit(stack_limit);
 #endif
-
-  fprintf(stderr, "[PState] Activated on M-thread (IsolateData=%p)\n",
-          static_cast<void*>(state->isolate_data));
-  fflush(stderr);
 }
 
 void GoroutineThreadState::DeactivatePState() {
-  if (g_active_p_state) {
-    fprintf(stderr, "[PState] Deactivated on M-thread\n");
-    fflush(stderr);
-  }
   g_active_p_state = nullptr;
   v8_goroutine_thread = false;
 }

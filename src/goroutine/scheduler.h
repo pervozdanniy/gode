@@ -13,69 +13,47 @@ namespace node {
 namespace goroutine {
 
 // Forward declarations
-class P;
 class M;
 class Runtime;
 
-// Runnable queue size (matching Go)
+// Per-thread local runnable queue size
 constexpr uint32_t kRunqSize = 256;
 
-// Processor (P) - execution context with local runnable queue + V8 state.
-// Following Go: P owns mcache (≈ IsolateData with LABs) and local runqueue.
-class P {
- public:
-  explicit P(uint32_t id);
-  ~P();
+// Per-thread local queue (owned by Scheduler, indexed by thread id).
+// No P abstraction — queues belong directly to M threads.
+struct LocalQueue {
+  std::atomic<uint32_t> head{0};
+  std::atomic<uint32_t> tail{0};
+  G* runq[kRunqSize];
 
-  uint32_t id() const { return id_; }
+  LocalQueue() {
+    for (uint32_t i = 0; i < kRunqSize; i++) runq[i] = nullptr;
+  }
 
-  // V8 state lifecycle (called from main thread)
-  void InitV8State(v8::Isolate* isolate);
-  void DestroyV8State();
-
-  // V8 state activation (called from M-thread)
-  void Activate();    // M acquires this P
-  void Deactivate();  // M releases this P
-
-  void* v8_state() const { return v8_state_; }
-
-  // Local runnable queue operations (lock-free)
-  bool PushLocal(G* g);
-  G* PopLocal();
+  bool Push(G* g);
+  G* Pop();
   G* StealHalf(std::vector<G*>& stolen);
-
-  // Stats
-  uint32_t runq_size() const;
-
- private:
-  uint32_t id_;
-
-  // Per-P V8 state (opaque handle to GoroutinePState)
-  void* v8_state_ = nullptr;
-
-  // Lock-free circular buffer for runnable goroutines
-  std::atomic<uint32_t> runq_head_{0};
-  std::atomic<uint32_t> runq_tail_{0};
-  G* runq_[kRunqSize];
-
-  // TODO: Per-P memory cache (mcache)
+  uint32_t size() const;
 };
 
-// Global scheduler
+// Global scheduler — GM model (no P).
+//
+// Local queues are per-M (per-thread), stored in the scheduler
+// and indexed by thread id. Work stealing operates on thread ids.
 class Scheduler {
  public:
   static Scheduler* GetInstance();
 
   // Lifecycle
-  void Init(uint32_t gomaxprocs);
+  void Init(uint32_t num_threads);
   void Shutdown();
   bool IsInitialized() const { return initialized_.load(); }
 
-  // Schedule goroutine
+  // Schedule goroutine (adds to global queue)
   void Schedule(G* g);
 
-  // Find runnable goroutine (called by M)
-  G* FindRunnable(P* p);
+  // Find runnable goroutine for thread tid
+  G* FindRunnable(uint32_t tid);
 
   // Park current goroutine (block)
   void Park(G* g, const char* reason);
@@ -86,8 +64,10 @@ class Scheduler {
   // Explicit yield
   void Yield();
 
-  // Get processor for current thread
-  P* GetP();
+  // Get/allocate local queue for thread
+  LocalQueue* GetLocalQueue(uint32_t tid);
+
+  uint32_t num_threads() const { return num_threads_; }
 
  private:
   Scheduler() = default;
@@ -99,14 +79,17 @@ class Scheduler {
   // Global run queue
   void PushGlobal(G* g);
   G* PopGlobal();
-  bool StealFromGlobal(P* p, uint32_t batch_size);
+  bool StealFromGlobal(uint32_t tid, uint32_t batch_size);
 
   std::atomic<bool> initialized_{false};
   std::atomic<bool> shutdown_{false};
 
-  // Processors
-  std::vector<P*> procs_;
-  uint32_t gomaxprocs_ = 0;
+  // Per-thread local queues (indexed by thread id)
+  std::vector<LocalQueue*> local_queues_;
+  uint32_t num_threads_ = 0;
+
+  // Schedtick per thread (for global queue fairness)
+  std::vector<std::atomic<uint32_t>> schedtick_;
 
   // Global runnable queue
   Mutex global_mutex_;

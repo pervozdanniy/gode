@@ -54,6 +54,11 @@ void Go(const FunctionCallbackInfo<Value>& args) {
 
     Environment* env = Environment::GetCurrent(args);
     runtime->Init(gomaxprocs, env->event_loop(), isolate);
+
+    // Register cleanup so workers call isolate->Exit() before teardown.
+    env->AtExit([](void*) {
+      goroutine::Runtime::GetInstance()->Shutdown();
+    }, nullptr);
   }
 
   Local<v8::Function> func = args[0].As<v8::Function>();

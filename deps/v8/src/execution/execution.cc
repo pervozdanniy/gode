@@ -4,7 +4,6 @@
 
 #include "src/execution/execution.h"
 
-#include <cstdio>  // For goroutine debug logging
 
 #include "src/api/api-inl.h"
 #include "src/debug/debug.h"

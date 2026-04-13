@@ -3,148 +3,102 @@
 #include <algorithm>
 #include <random>
 
-// C-linkage API from V8 goroutine patches (goroutine-thread-state.cc)
-extern "C" void* v8_goroutine_p_state_create(v8::Isolate* isolate);
-extern "C" void  v8_goroutine_p_state_activate(void* p_state);
-extern "C" void  v8_goroutine_p_state_deactivate();
-extern "C" void  v8_goroutine_p_state_destroy(void* p_state);
-
 namespace node {
 namespace goroutine {
 
-// P implementation
-P::P(uint32_t id) : id_(id), v8_state_(nullptr) {
-    for (uint32_t i = 0; i < kRunqSize; i++) {
-      runq_[i] = nullptr;
-    }
-}
+// ---- LocalQueue implementation ----
 
-P::~P() {
-    DestroyV8State();
-    while (G* g = PopLocal()) {
-      delete g;
-    }
-}
+bool LocalQueue::Push(G* g) {
+  uint32_t t = tail.load(std::memory_order_relaxed);
+  uint32_t h = head.load(std::memory_order_acquire);
 
-void P::InitV8State(v8::Isolate* isolate) {
-  if (v8_state_) return;  // already initialized
-  v8_state_ = v8_goroutine_p_state_create(isolate);
-  fprintf(stderr, "[P%u] V8 state initialized\n", id_);
-  fflush(stderr);
-}
-
-void P::DestroyV8State() {
-  if (!v8_state_) return;
-  v8_goroutine_p_state_destroy(v8_state_);
-  v8_state_ = nullptr;
-}
-
-void P::Activate() {
-  if (v8_state_) {
-    v8_goroutine_p_state_activate(v8_state_);
-  }
-}
-
-void P::Deactivate() {
-  v8_goroutine_p_state_deactivate();
-}
-
-bool P::PushLocal(G* g) {
-  uint32_t tail = runq_tail_.load(std::memory_order_relaxed);
-  uint32_t head = runq_head_.load(std::memory_order_acquire);
-
-  // Check if queue is full
-  if (tail - head >= kRunqSize) {
-    return false;
+  if (t - h >= kRunqSize) {
+    return false;  // full
   }
 
-  runq_[tail % kRunqSize] = g;
-  runq_tail_.store(tail + 1, std::memory_order_release);
+  runq[t % kRunqSize] = g;
+  tail.store(t + 1, std::memory_order_release);
   return true;
 }
 
-G* P::PopLocal() {
-  uint32_t tail = runq_tail_.load(std::memory_order_relaxed);
-  uint32_t head = runq_head_.load(std::memory_order_acquire);
+G* LocalQueue::Pop() {
+  uint32_t t = tail.load(std::memory_order_relaxed);
+  uint32_t h = head.load(std::memory_order_acquire);
 
-  // Check if queue is empty
-  if (head >= tail) {
-    return nullptr;
+  if (h >= t) {
+    return nullptr;  // empty
   }
 
-  // Pop from head (FIFO)
-  G* g = runq_[head % kRunqSize];
-  runq_head_.store(head + 1, std::memory_order_release);
+  G* g = runq[h % kRunqSize];
+  head.store(h + 1, std::memory_order_release);
   return g;
 }
 
-G* P::StealHalf(std::vector<G*>& stolen) {
-  uint32_t tail = runq_tail_.load(std::memory_order_acquire);
-  uint32_t head = runq_head_.load(std::memory_order_acquire);
+G* LocalQueue::StealHalf(std::vector<G*>& stolen) {
+  uint32_t t = tail.load(std::memory_order_acquire);
+  uint32_t h = head.load(std::memory_order_acquire);
 
-  uint32_t size = tail - head;
-  if (size == 0) {
-    return nullptr;
+  uint32_t sz = t - h;
+  if (sz == 0) return nullptr;
+
+  uint32_t n = sz / 2;
+  if (n == 0) n = 1;
+
+  uint32_t new_head = h + n;
+  if (!head.compare_exchange_strong(h, new_head)) {
+    return nullptr;  // contention
   }
 
-  // Steal half
-  uint32_t n = size / 2;
-  if (n == 0) {
-    n = 1;
-  }
-
-  // Try to update head
-  uint32_t new_head = head + n;
-  if (!runq_head_.compare_exchange_strong(head, new_head)) {
-    return nullptr;  // Someone else modified it
-  }
-
-  // Copy stolen goroutines
   for (uint32_t i = 0; i < n; i++) {
-    stolen.push_back(runq_[(head + i) % kRunqSize]);
+    stolen.push_back(runq[(h + i) % kRunqSize]);
   }
-
   return stolen.empty() ? nullptr : stolen[0];
 }
 
-uint32_t P::runq_size() const {
-  uint32_t tail = runq_tail_.load(std::memory_order_acquire);
-  uint32_t head = runq_head_.load(std::memory_order_acquire);
-  return tail > head ? tail - head : 0;
+uint32_t LocalQueue::size() const {
+  uint32_t t = tail.load(std::memory_order_acquire);
+  uint32_t h = head.load(std::memory_order_acquire);
+  return t > h ? t - h : 0;
 }
 
-// Scheduler implementation
+// ---- Scheduler implementation ----
+
 Scheduler* Scheduler::GetInstance() {
   static Scheduler instance;
   return &instance;
 }
 
-void Scheduler::Init(uint32_t gomaxprocs) {
-  if (initialized_.exchange(true)) {
-    return;  // Already initialized
+void Scheduler::Init(uint32_t num_threads) {
+  if (initialized_.exchange(true)) return;
+
+  num_threads_ = num_threads;
+
+  // Create per-thread local queues
+  local_queues_.resize(num_threads);
+  for (uint32_t i = 0; i < num_threads; i++) {
+    local_queues_[i] = new LocalQueue();
   }
 
-  gomaxprocs_ = gomaxprocs;
-
-  // Create processors
-  procs_.resize(gomaxprocs);
-  for (uint32_t i = 0; i < gomaxprocs; i++) {
-    procs_[i] = new P(i);
+  // Per-thread schedtick counters
+  schedtick_.resize(num_threads);
+  for (uint32_t i = 0; i < num_threads; i++) {
+    schedtick_[i].store(0);
   }
 
   runtime_ = Runtime::GetInstance();
 }
 
 void Scheduler::Shutdown() {
-  if (!initialized_.load() || shutdown_.exchange(true)) {
-    return;
-  }
+  if (!initialized_.load() || shutdown_.exchange(true)) return;
 
-  // Clean up processors
-  for (P* p : procs_) {
-    delete p;
+  // Clean up local queues
+  for (LocalQueue* lq : local_queues_) {
+    while (G* g = lq->Pop()) {
+      delete g;
+    }
+    delete lq;
   }
-  procs_.clear();
+  local_queues_.clear();
 
   // Clean up global queue
   {
@@ -161,48 +115,50 @@ void Scheduler::Schedule(G* g) {
 
   g->SetState(GState::Grunnable);
 
-  // Try to add to current P's local queue
-  // For now, add to global queue (will improve with thread-local P)
+  // TODO: try to add to current thread's local queue first
   PushGlobal(g);
 }
 
-G* Scheduler::FindRunnable(P* p) {
-  if (!p) return nullptr;
+G* Scheduler::FindRunnable(uint32_t tid) {
+  if (tid >= local_queues_.size()) return nullptr;
+  LocalQueue* lq = local_queues_[tid];
 
-  // 1. Check local runq
-  G* g = p->PopLocal();
-  if (g) {
-    return g;
-  }
-
-  // 2. Check global runq
-  if (StealFromGlobal(p, 10)) {
-    g = p->PopLocal();
+  // 1. Every 61st tick → check global first (prevents starvation)
+  uint32_t tick = schedtick_[tid].fetch_add(1, std::memory_order_relaxed);
+  if (tick % 61 == 0) {
+    G* g = PopGlobal();
     if (g) return g;
   }
 
-  // 3. Work stealing from random P
-  if (procs_.size() > 1) {
+  // 2. Own local queue
+  G* g = lq->Pop();
+  if (g) return g;
+
+  // 3. Global queue
+  if (StealFromGlobal(tid, 10)) {
+    g = lq->Pop();
+    if (g) return g;
+  }
+
+  // 4. Work stealing — steal half from a random thread
+  if (local_queues_.size() > 1) {
     static thread_local std::random_device rd;
     static thread_local std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, procs_.size() - 1);
+    std::uniform_int_distribution<uint32_t> dis(0, local_queues_.size() - 1);
 
-    // Try stealing from random processors
-    for (uint32_t i = 0; i < procs_.size(); i++) {
-      uint32_t victim_id = dis(gen);
-      P* victim = procs_[victim_id];
+    for (uint32_t i = 0; i < local_queues_.size(); i++) {
+      uint32_t victim = dis(gen);
+      if (victim == tid) continue;
 
-      if (victim != p) {
-        std::vector<G*> stolen;
-        victim->StealHalf(stolen);
+      std::vector<G*> stolen;
+      local_queues_[victim]->StealHalf(stolen);
 
-        if (!stolen.empty()) {
-          // Add all but first to local queue
-          for (size_t j = 1; j < stolen.size(); j++) {
-            p->PushLocal(stolen[j]);
-          }
-          return stolen[0];
+      if (!stolen.empty()) {
+        // Put all but first into our local queue
+        for (size_t j = 1; j < stolen.size(); j++) {
+          lq->Push(stolen[j]);
         }
+        return stolen[0];
       }
     }
   }
@@ -213,7 +169,6 @@ G* Scheduler::FindRunnable(P* p) {
 void Scheduler::Park(G* g, const char* reason) {
   if (!g) return;
   g->SetState(GState::Gwaiting);
-  // TODO: Add to waiting structures
 }
 
 void Scheduler::Ready(G* g) {
@@ -222,17 +177,16 @@ void Scheduler::Ready(G* g) {
 }
 
 void Scheduler::Yield() {
-  // TODO: Implement cooperative yield
-  // Will require context switching
+  // TODO: cooperative yield with context switching
 }
 
-P* Scheduler::GetP() {
-  // TODO: Implement thread-local P retrieval
-  // For now, return first P
-  return procs_.empty() ? nullptr : procs_[0];
+LocalQueue* Scheduler::GetLocalQueue(uint32_t tid) {
+  if (tid >= local_queues_.size()) return nullptr;
+  return local_queues_[tid];
 }
 
-// Global queue operations
+// ---- Global queue operations ----
+
 void Scheduler::PushGlobal(G* g) {
   Mutex::ScopedLock lock(global_mutex_);
   global_runq_.push_back(g);
@@ -240,35 +194,29 @@ void Scheduler::PushGlobal(G* g) {
 
 G* Scheduler::PopGlobal() {
   Mutex::ScopedLock lock(global_mutex_);
-  if (global_runq_.empty()) {
-    return nullptr;
-  }
+  if (global_runq_.empty()) return nullptr;
 
   G* g = global_runq_.front();
   global_runq_.erase(global_runq_.begin());
   return g;
 }
 
-bool Scheduler::StealFromGlobal(P* p, uint32_t batch_size) {
+bool Scheduler::StealFromGlobal(uint32_t tid, uint32_t batch_size) {
   Mutex::ScopedLock lock(global_mutex_);
+  if (global_runq_.empty()) return false;
 
-  if (global_runq_.empty()) {
-    return false;
-  }
-
-  // Take up to batch_size from global
+  LocalQueue* lq = local_queues_[tid];
   uint32_t n = std::min(batch_size, static_cast<uint32_t>(global_runq_.size()));
 
   for (uint32_t i = 0; i < n; i++) {
-    if (!global_runq_.empty()) {
-      G* g = global_runq_.front();
-      global_runq_.erase(global_runq_.begin());
+    if (global_runq_.empty()) break;
 
-      if (!p->PushLocal(g)) {
-        // Local queue full, put back
-        global_runq_.insert(global_runq_.begin(), g);
-        break;
-      }
+    G* g = global_runq_.front();
+    global_runq_.erase(global_runq_.begin());
+
+    if (!lq->Push(g)) {
+      global_runq_.insert(global_runq_.begin(), g);
+      break;
     }
   }
 
