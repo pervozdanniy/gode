@@ -80,10 +80,7 @@ void Scheduler::Init(uint32_t num_threads) {
   }
 
   // Per-thread schedtick counters
-  schedtick_.resize(num_threads);
-  for (uint32_t i = 0; i < num_threads; i++) {
-    schedtick_[i].store(0);
-  }
+  schedtick_.assign(num_threads, 0);
 
   runtime_ = Runtime::GetInstance();
 }
@@ -124,7 +121,7 @@ G* Scheduler::FindRunnable(uint32_t tid) {
   LocalQueue* lq = local_queues_[tid];
 
   // 1. Every 61st tick → check global first (prevents starvation)
-  uint32_t tick = schedtick_[tid].fetch_add(1, std::memory_order_relaxed);
+  uint32_t tick = schedtick_[tid]++;
   if (tick % 61 == 0) {
     G* g = PopGlobal();
     if (g) return g;

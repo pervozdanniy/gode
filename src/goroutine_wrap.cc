@@ -4,12 +4,19 @@
 #include "node_external_reference.h"
 #include "util-inl.h"
 #include "v8.h"
+#include <cstdio>
 #include <cstdlib>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "goroutine/runtime.h"
 #include "goroutine/scheduler.h"
 #include "goroutine/g.h"
 #include "goroutine/context.h"
+
+#define GWRAP_TRACE(fmt, ...) \
+  fprintf(stderr, "[GWRAP  tid=%ld] " fmt "\n", \
+          (long)syscall(SYS_gettid), ##__VA_ARGS__)
 
 namespace node {
 namespace goroutine_wrap {
@@ -45,6 +52,7 @@ void Go(const FunctionCallbackInfo<Value>& args) {
     uint32_t gomaxprocs = 1;
 
     const char* env_gomaxprocs = getenv("NODE_GOMAXPROCS");
+    if (!env_gomaxprocs) env_gomaxprocs = getenv("GOMAXPROCS");
     if (env_gomaxprocs) {
       int parsed = atoi(env_gomaxprocs);
       if (parsed > 0 && parsed <= 256) {
@@ -71,6 +79,7 @@ void Go(const FunctionCallbackInfo<Value>& args) {
 
   // Create goroutine and schedule it.
   goroutine::G* g = new goroutine::G(isolate, func, func_args);
+  GWRAP_TRACE("go(): created G%llu, scheduling...", (unsigned long long)g->goid());
   goroutine::Scheduler::GetInstance()->Schedule(g);
   // Wake worker M-threads so they can pick up the goroutine.
   goroutine::Runtime::GetInstance()->NotifyGoroutineAvailable();
@@ -92,6 +101,13 @@ void Goid(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(Number::New(isolate, id));
 }
 
+// threadid() — get OS thread ID (Linux gettid) of the calling M thread.
+void Threadid(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+  args.GetReturnValue().Set(Number::New(isolate, static_cast<double>(tid)));
+}
+
 void Initialize(Local<Object> target,
                 Local<Value> unused,
                 Local<Context> context,
@@ -99,12 +115,14 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "go", Go);
   SetMethod(context, target, "yield", Yield);
   SetMethod(context, target, "goid", Goid);
+  SetMethod(context, target, "threadid", Threadid);
 }
 
 void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(Go);
   registry->Register(Yield);
   registry->Register(Goid);
+  registry->Register(Threadid);
 }
 
 }  // namespace goroutine_wrap

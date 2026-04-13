@@ -88,8 +88,9 @@ class Scheduler {
   std::vector<LocalQueue*> local_queues_;
   uint32_t num_threads_ = 0;
 
-  // Schedtick per thread (for global queue fairness)
-  std::vector<std::atomic<uint32_t>> schedtick_;
+  // Schedtick per thread (for global queue fairness).
+  // Plain uint32_t: each slot is accessed only by its owning thread.
+  std::vector<uint32_t> schedtick_;
 
   // Global runnable queue
   Mutex global_mutex_;

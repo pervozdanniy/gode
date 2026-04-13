@@ -48,6 +48,10 @@ class G {
   // Linking for queues
   G* waitlink = nullptr;
 
+  // GC state (GoroutineGCState*): registers goroutine mmap stack as GC root
+  // when yielded, so GC can scan/update interpreter register pointers.
+  void* gc_state() const { return gc_state_; }
+
   // Delete copy/move constructors
   G(const G&) = delete;
   G& operator=(const G&) = delete;
@@ -69,6 +73,7 @@ class G {
   // Saved V8 HandleScopeData for context-switch isolation.
   alignas(8) char saved_hsd_[64];
   bool has_saved_hsd_ = false;
+  void* gc_state_ = nullptr;
 
  public:
   void* saved_hsd_buf() { return saved_hsd_; }

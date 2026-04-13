@@ -4,35 +4,84 @@
 
 ### Фаза 1: Патч V8 — общий heap
 
-**1.1 GC Safepoints для внешних тредов**
+**1.1 GC Safepoints для M тредов** ✅ DONE
 
 ```
-Файлы: src/heap/safepoint.cc, safepoint.h
+Реализовано через: deps/v8/src/execution/goroutine-local-heap.h/cc
 
-Изменения:
-  - ExternalThreadRegistry — список всех M тредов
-  - При старте M треда → регистрация в registry
-  - IsolateSafepoint::StopTheWorld() → останавливает все M
-  - M треды проверяют safepoint request в scheduler loop
-    между горутинами (не на каждой инструкции)
+Каждый M worker тред создаёт LocalHeap (kBackground):
+  - Регистрируется в V8's IsolateSafepoint автоматически
+  - Участвует в StopTheWorld без кастомного registry
+  - LocalHeap::Park()      → M тред GC-safe (sem_wait, между горутинами)
+  - LocalHeap::Unpark()    → M тред начинает исполнение (блокирует если GC идёт)
+  - LocalHeap::Safepoint() → кооперативная проверка между горутинами (~1ns fast path)
+  - LocalHeap также вызывает Isolate::SetCurrent() — заменяет isolate->Enter()
 
-Тест: 4 M треда читают heap пока GC работает → нет крашей
-~130 строк
+Старый GoroutineSafepointRegistry — удалён.
+goroutine-safepoint.h/cc — удалены.
+
+Тест: 4 M треда читают heap пока GC работает → нет крашей ✅
 ```
 
-**1.2 GC не эвакуирует shared объекты**
+**1.2 GC не ломает указатели горутин** ✅ DONE
 
 ```
-Файлы: src/heap/mark-compact.cc, heap-object.h
+Реализовано через: deps/v8/src/execution/goroutine-gc-roots.h/cc
+                   + gc_state_ в G struct (src/goroutine/g.h)
+                   + gc_park/gc_unpark в YieldG (src/goroutine/context.cc)
 
-Изменения:
-  - Флаг is_shared в Map (Shape) объекта
-  - Все новые объекты → is_shared = true по умолчанию
-  - Scavenger: shared объекты → сразу old generation
-  - Mark-Compact: не эвакуировать shared объекты
+Механизм:
+  yield() → gc_park():
+    Сохраняет ThreadLocalTop горутины (содержит c_entry_fp_ — начало
+    цепочки V8 фреймов на mmap-стеке горутины).
+    Регистрирует горутину в GoroutineGCRegistry.
 
-Тест: M тред держит pointer → GC не ломает pointer
-~80 строк
+  GC IterateRoots() → GoroutineGCRegistry::IterateRoots():
+    Для каждой yielded горутины:
+      StackFrameIterator(isolate, saved_tlt) → обходит mmap-стек
+      frame->Iterate(visitor) → обновляет все tagged-указатели in-place
+    Таким образом GC МОЖЕТ эвакуировать объекты (двигать их),
+    и указатели в стеке горутины корректно обновляются.
+
+  resume() → gc_unpark():
+    Снимает регистрацию. Горутина продолжает с актуальными указателями.
+
+  Пока горутина ВЫПОЛНЯЕТСЯ (не yielded):
+    M тред в состоянии Unparked → GC ждёт Safepoint()
+    Горутина рано или поздно вызывает yield() → gc_park → GC обновляет
+    Гарантия: no running goroutine during evacuation.
+
+Подход отличается от исходного плана:
+  Исходный план: запрет эвакуации (is_shared flag, NEVER_EVACUATE)
+  Реализация:    разрешить эвакуацию + обновлять указатели через GC roots
+
+Тест: M тред держит pointer → GC не ломает pointer ✅
+```
+
+**GVL (Global V8 Lock) + ThreadLoop дедлок-фикс** ✅ FIXED
+
+```
+Проблема: при GOMAXPROCS > 1 процесс зависал.
+  Старый порядок в ThreadLoop:
+    unpark() → (Running) → lock GVL → RunG → unlock → park
+  Deadlock: M тред в Running ждёт GVL → GC не может дождаться safepoint.
+
+Фикс (src/goroutine/runtime.cc — M::ThreadLoop):
+  Новый порядок:
+    FindRunnable() пока Parked  ← нет обращений к V8 heap, GC-safe
+    lock GVL                    ← ждём мьютекс пока Parked → GC работает
+    unpark()                    ← Running только внутри GVL
+    RunG()
+    park()                      ← Parked до release GVL
+    unlock GVL                  ← другой M или GC может продолжить
+
+  M0 (ExecuteOne) не меняется: main thread всегда Running,
+    park/unpark не нужны, просто lock GVL → RunG → unlock.
+
+GVL = static std::mutex g_v8_lock в runtime.cc.
+Убирается в Phase 2 (per-thread JIT cache делает параллельный V8 безопасным).
+
+Тест: GOMAXPROCS=4, context switch test → нет зависания ✅
 ```
 
 **1.3 SeqLock на shape transitions**
@@ -50,19 +99,6 @@
 
 Тест: main тред добавляет свойства → M тред читает → нет UB
 ~150 строк
-```
-
-**1.4 Shared String Table**
-
-```
-Файлы: src/strings/string-table.cc
-
-Изменения:
-  - Мьютекс на string internment
-  - String objects → always old generation
-
-Тест: M тред создаёт строку → main тред читает → корректно
-~80 строк
 ```
 
 ---
@@ -554,88 +590,86 @@ void Select(vector<ChannelOp> ops, Goroutine* g) {
 
 ---
 
-### Итоговый объём
+### Фаза 7: Переименование — Coroutines / Co
+
+**Цель:** убрать все отсылки к Go и горутинам. Это самостоятельная концепция.
+
+**7.1 Переименование рантайма**
 
 ```
-Фаза 1: Патч V8 (общий heap)
-  GC safepoints                  ~130 строк
-  GC не эвакуирует shared        ~80 строк
-  SeqLock shape transitions      ~150 строк
-  Shared string table            ~80 строк
-  Итого V8:                      ~440 строк
+Внутренние имена (C++):
+  G (Goroutine)          → Co (Coroutine)
+  M (Machine)            → M (оставить — нейтральное)
+  GState::Grunnable      → CoState::Runnable
+  GState::Grunning       → CoState::Running
+  GState::Gwaiting       → CoState::Waiting
+  GState::Gdead          → CoState::Dead
+  GOMAXPROCS             → CO_MAXPROCS (или просто MAXPROCS)
 
-Фаза 2: Per-thread JIT
-  PerThreadJitCache              ~200 строк
-  Per-thread FeedbackVector      ~150 строк
-  Ignition call path             ~80 строк
-  Итого V8:                      ~430 строк
-
-Фаза 3: Goroutine runtime
-  Goroutine struct               ~200 строк
-  Stack в shared heap            ~200 строк
-  Планировщик + work stealing    ~300 строк
-  JS API                         ~150 строк
-  Итого:                         ~850 строк
-
-Фаза 4: Unified thread pool
-  UnifiedThreadPool              ~200 строк
-  Динамический размер            ~100 строк
-  libuv интеграция               ~150 строк
-  Итого:                         ~450 строк
-
-Фаза 5: Per-M uv_loop
-  Инициализация loops            ~80 строк
-  Регистрация fd / парковка      ~100 строк
-  IO ready callback + read       ~120 строк
-  Перерегистрация (select)       ~80 строк
-  Итого:                         ~380 строк
-
-Фаза 6: Channels + примитивы
-  Channel                        ~250 строк
-  SharedMutex / RWMutex          ~150 строк
-  select                         ~150 строк
-  Итого:                         ~550 строк
-
-─────────────────────────────────────────────
-Патч V8:                         ~870 строк
-Новый рантайм:                   ~2230 строк
-Итого:                           ~3100 строк
+Файлы:
+  src/goroutine/         → src/coroutine/
+  goroutine_wrap.cc      → coroutine_wrap.cc
+  lib/goroutine.js       → lib/coroutine.js
+  lib/internal/goroutine.js → lib/internal/coroutine.js
 ```
 
----
+**7.2 JS Public API**
 
-### Порядок разработки
+```javascript
+// Было:
+const { go, yield, goid } = require('goroutines')
+go(fn, ...args)
+yield()
+goid()
+
+// Станет:
+const Co = require('coroutines')
+Co.run(fn, ...args)   // запустить корутину
+Co.yield()            // уступить управление
+Co.id()               // id текущей корутины
+Co.exit()             // завершить текущую корутину
+
+// Каналы:
+const ch = new Co.Channel(16)
+await ch.send(value)
+const value = await ch.recv()
+ch.close()
+for await (const v of ch) { ... }
+
+// Sync:
+const mu = new Co.Mutex()
+const rwmu = new Co.RWMutex()
+
+// Select:
+const { value, from } = await Co.select(
+    ch1.recv(),
+    ch2.recv(),
+    Co.timeout(1000)
+)
+```
+
+**7.3 V8 патчи**
 
 ```
-Недели 1-3:   Фаза 1 — патч V8
-  Тест: M треды читают heap во время GC → нет крашей
-  Тест: shape transition во время чтения → корректно
+Переименовать без изменения логики:
+  v8_goroutine_thread        → v8_coroutine_thread
+  v8_goroutine_p_state_*     → v8_coroutine_m_state_*
+  v8_goroutine_gc_*          → v8_coroutine_gc_*
+  v8_goroutine_local_heap_*  → v8_coroutine_local_heap_*
+  goroutine-thread.h/cc      → coroutine-thread.h/cc
+  goroutine-thread-state.h/cc → coroutine-thread-state.h/cc
+  goroutine-gc-roots.h/cc    → coroutine-gc-roots.h/cc
+  goroutine-local-heap.h/cc  → coroutine-local-heap.h/cc
+  goroutine-safepoint.h/cc   → coroutine-safepoint.h/cc
+```
 
-Недели 4-6:   Фаза 2 — per-thread JIT
-  Тест: функция компилируется независимо per-thread
-  Тест: deopt в M1 не влияет на M2
+**7.4 Env переменная**
 
-Недели 7-9:   Фаза 3 — горутины + планировщик
-  Тест: горутина мигрирует между тредами
-  Тест: 10k горутин на 4 тредах, work stealing
-  Тест: замыкания доступны после миграции
+```
+NODE_GOMAXPROCS → CO_MAXPROCS
+```
 
-Недели 10-11: Фаза 4 — unified thread pool
-  Тест: fs.readFile в горутине не блокирует пул
-  Тест: динамическое создание тредов при syscall burst
-
-Недели 12-13: Фаза 5 — per-M uv_loop
-  Тест: net.read() паркует горутину корректно
-  Тест: данные читаются прямо в shared heap
-  Тест: 10k одновременных соединений
-
-Недели 14-15: Фаза 6 — channels
-  Тест: producer/consumer между горутинами
-  Тест: select с таймаутом
-  Тест: закрытый канал
-
-Недели 16-17: интеграция + бенчмарки
-  Тест: реальный HTTP сервер
-  Бенчмарк: сравнение с Node.js на data-heavy задачах
-  Бенчмарк: передача больших объектов vs worker_threads
+**Порядок:** делается в самом конце одним большим rename-рефакторингом.
+Все семантические изменения к этому моменту уже завершены.
+Это чисто механическая операция — grep/sed + проверка компиляции.
 ```

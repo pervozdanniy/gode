@@ -19,6 +19,15 @@
 #include "src/objects/shared-function-info.h"
 #include "src/runtime/runtime-utils.h"
 
+// Goroutine worker thread safety: serialise lazy compilation.
+// Multiple M-threads share one Isolate, so Compiler::Compile (which uses
+// Isolate-level ReusableUnoptimizedCompileState) must not run concurrently.
+// Removed when Phase-2 per-thread JIT cache is implemented.
+#include <mutex>
+namespace {
+std::mutex g_compile_mutex;
+}  // namespace
+
 namespace v8::internal {
 
 namespace {
@@ -71,9 +80,15 @@ RUNTIME_FUNCTION(Runtime_CompileLazy) {
   }
 #endif
   IsCompiledScope is_compiled_scope;
-  if (!Compiler::Compile(isolate, function, Compiler::KEEP_EXCEPTION,
-                         &is_compiled_scope)) {
-    return ReadOnlyRoots(isolate).exception();
+  {
+    // Serialise bytecode compilation across M worker threads.
+    // ReusableUnoptimizedCompileState on Isolate is not thread-safe.
+    // This lock is removed in Phase-2 (per-thread JIT cache).
+    std::unique_lock<std::mutex> compile_lock(g_compile_mutex);
+    if (!Compiler::Compile(isolate, function, Compiler::KEEP_EXCEPTION,
+                           &is_compiled_scope)) {
+      return ReadOnlyRoots(isolate).exception();
+    }
   }
 #ifndef V8_ENABLE_LEAPTIERING
   if (V8_UNLIKELY(v8_flags.log_function_events)) {

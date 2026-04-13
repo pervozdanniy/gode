@@ -2,21 +2,31 @@
 #include "scheduler.h"
 #include "context.h"
 
-// V8 goroutine-thread TLS flag (defined in deps/v8).
+#include <cstdio>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define GTRACE(fmt, ...) \
+  fprintf(stderr, "[GTRACE tid=%ld] " fmt "\n", \
+          (long)syscall(SYS_gettid), ##__VA_ARGS__)
+
+// V8 goroutine-thread TLS flag (defined in deps/v8/src/execution/goroutine-thread.cc)
 extern thread_local bool v8_goroutine_thread;
 
-// C-linkage API from V8 goroutine patches (goroutine-thread-state.cc)
+// Per-M V8 IsolateData state (goroutine-thread-state.cc)
 extern "C" void* v8_goroutine_p_state_create(v8::Isolate* isolate);
 extern "C" void  v8_goroutine_p_state_activate(void* state);
 extern "C" void  v8_goroutine_p_state_deactivate();
 extern "C" void  v8_goroutine_p_state_destroy(void* state);
 
-// C-linkage API from V8 goroutine GC safepoint (goroutine-safepoint.cc)
-extern "C" void* v8_goroutine_safepoint_register();
-extern "C" void  v8_goroutine_safepoint_unregister(void* handle);
-extern "C" void  v8_goroutine_safepoint_set_running(void* handle);
-extern "C" void  v8_goroutine_safepoint_set_parked(void* handle);
-extern "C" void  v8_goroutine_safepoint_check(void* handle);
+// Per-M LocalHeap for GC safepoint coordination (goroutine-local-heap.cc).
+// LocalHeap also calls Isolate::SetCurrent() so v8::Isolate::GetCurrent()
+// works on worker threads without isolate->Enter().
+extern "C" void* v8_goroutine_local_heap_create(v8::Isolate* isolate);
+extern "C" void  v8_goroutine_local_heap_destroy(void* lh);
+extern "C" void  v8_goroutine_local_heap_park(void* lh);
+extern "C" void  v8_goroutine_local_heap_unpark(void* lh);
+extern "C" void  v8_goroutine_local_heap_safepoint(void* lh);
 
 namespace node {
 namespace goroutine {
@@ -37,24 +47,12 @@ void M::DestroyV8State() {
   v8_state_ = nullptr;
 }
 
-void M::ActivateV8State() {
-  if (v8_state_) {
-    v8_goroutine_p_state_activate(v8_state_);
-  }
-}
-
-void M::DeactivateV8State() {
-  v8_goroutine_p_state_deactivate();
-}
-
-void M::CheckSafepoint() {
-  v8_goroutine_safepoint_check(safepoint_entry_);
-}
-
 bool M::ExecuteOne(v8::Isolate* isolate) {
   Scheduler* sched = Scheduler::GetInstance();
   G* g = sched->FindRunnable(id_);
   if (!g) return false;
+
+  GTRACE("M0(id=%u) picked G%llu", id_, (unsigned long long)g->goid());
 
   current_g_ = g;
   g->SetState(GState::Grunning);
@@ -90,53 +88,60 @@ void M::ThreadLoop() {
   Runtime* rt = runtime_;
   v8::Isolate* isolate = rt->isolate();
 
-  v8_goroutine_thread = true;
-  isolate->Enter();
+  GTRACE("Worker M(id=%u) started", id_);
 
-  // Register this M thread with the GC safepoint registry.
-  safepoint_entry_ = v8_goroutine_safepoint_register();
+  // Create LocalHeap — starts Parked (GC-safe).
+  local_heap_ = v8_goroutine_local_heap_create(isolate);
+  v8_goroutine_p_state_activate(v8_state_);
+
+  // Link LocalHeap to per-M StackGuard so GC safepoints can interrupt this
+  // goroutine worker thread's interpreter via RequestInterruptUnsafe().
+  uintptr_t sp = reinterpret_cast<uintptr_t>(&sp);
+  isolate->SetStackLimit(sp - (900 * 1024));
 
   while (running_.load()) {
-    // M is parked (in sem_wait) — GC-safe.
-    v8_goroutine_safepoint_set_parked(safepoint_entry_);
+    // ---- Parked: waiting for work signal (GC-safe) ----
+    GTRACE("Worker M(id=%u) waiting on sem...", id_);
     uv_sem_wait(&rt->goroutine_sem_);
     if (!running_.load()) break;
 
-    uv_mutex_lock(&rt->v8_mutex_);
+    GTRACE("Worker M(id=%u) woke up, draining queue", id_);
 
-    uintptr_t sp = reinterpret_cast<uintptr_t>(&sp);
-    isolate->SetStackLimit(sp - (900 * 1024));
-
-    // M is now running — notify GC safepoint registry.
-    v8_goroutine_safepoint_set_running(safepoint_entry_);
-
+    // Inner loop: drain goroutines while available.
+    int count = 0;
     while (running_.load()) {
-      if (!ExecuteOne(isolate)) break;
+      Scheduler* sched = Scheduler::GetInstance();
+      G* g = sched->FindRunnable(id_);
+      if (!g) break;
 
-      // Between goroutines: check if GC needs us to stop.
-      CheckSafepoint();
+      GTRACE("Worker M(id=%u) picked G%llu", id_, (unsigned long long)g->goid());
+      count++;
 
-      // Briefly release V8 so M0 can reacquire after epoll.
-      uv_mutex_unlock(&rt->v8_mutex_);
-      uv_mutex_lock(&rt->v8_mutex_);
+      current_g_ = g;
+      g->SetState(GState::Grunning);
+
+      v8_goroutine_local_heap_unpark(local_heap_);
+      GTRACE("Worker M(id=%u) running G%llu", id_, (unsigned long long)g->goid());
+      RunG(g, isolate);
+      GTRACE("Worker M(id=%u) G%llu done/yielded", id_, (unsigned long long)g->goid());
+      v8_goroutine_local_heap_park(local_heap_);
+
+      current_g_ = nullptr;
+      if (g->state() == GState::Gdead) {
+        delete g;
+      }
     }
 
-    // Back to parked before releasing mutex.
-    v8_goroutine_safepoint_set_parked(safepoint_entry_);
-    uv_mutex_unlock(&rt->v8_mutex_);
+    GTRACE("Worker M(id=%u) inner loop done (ran %d goroutines)", id_, count);
 
-    // Wake event loop so callbacks can observe goroutine results.
     if (rt->async_init_) {
       uv_async_send(&rt->async_handle_);
     }
   }
 
-  // Unregister from GC safepoint registry before exiting.
-  v8_goroutine_safepoint_unregister(safepoint_entry_);
-  safepoint_entry_ = nullptr;
-
-  v8_goroutine_thread = false;
-  isolate->Exit();
+  v8_goroutine_p_state_deactivate();
+  v8_goroutine_local_heap_destroy(local_heap_);
+  local_heap_ = nullptr;
 }
 
 // ---- Runtime ----
@@ -154,30 +159,17 @@ void Runtime::Init(uint32_t num_threads, uv_loop_t* loop,
   loop_ = loop;
   isolate_ = isolate;
 
-
   scheduler_ = Scheduler::GetInstance();
   scheduler_->Init(num_threads);
-
-  // V8 execution token — M0 starts as the owner.
-  uv_mutex_init(&v8_mutex_);
-  v8_mutex_init_ = true;
-  uv_mutex_lock(&v8_mutex_);
 
   // Goroutine notification semaphore.
   uv_sem_init(&goroutine_sem_, 0);
   sem_init_ = true;
 
-  // M0 = main thread (tid=0), no separate V8 state needed.
+  // M0 = main thread (no LocalHeap needed — it already has the main one).
   m0_ = new M(0);
 
-  // uv_prepare: release V8 before the event loop enters I/O poll.
-  uv_prepare_init(loop_, &prepare_handle_);
-  prepare_handle_.data = this;
-  uv_prepare_start(&prepare_handle_, OnPrepare);
-  uv_unref(reinterpret_cast<uv_handle_t*>(&prepare_handle_));
-  prepare_active_ = true;
-
-  // uv_check: reacquire V8 after I/O poll.
+  // uv_check: M0 drains goroutine queue after I/O poll (GOMAXPROCS=1 mode).
   uv_check_init(loop_, &check_handle_);
   check_handle_.data = this;
   uv_check_start(&check_handle_, OnCheck);
@@ -206,11 +198,6 @@ void Runtime::Init(uint32_t num_threads, uv_loop_t* loop,
 void Runtime::Shutdown() {
   if (!initialized_.load() || shutdown_.exchange(true)) return;
 
-  // Release V8 mutex so workers can finish.
-  if (v8_mutex_init_) {
-    uv_mutex_unlock(&v8_mutex_);
-  }
-
   // Stop worker M-threads.
   for (M* m : workers_) {
     m->StopThread();
@@ -218,10 +205,6 @@ void Runtime::Shutdown() {
   }
   workers_.clear();
 
-  if (prepare_active_) {
-    uv_prepare_stop(&prepare_handle_);
-    prepare_active_ = false;
-  }
   if (check_active_) {
     uv_check_stop(&check_handle_);
     check_active_ = false;
@@ -235,11 +218,6 @@ void Runtime::Shutdown() {
     async_init_ = false;
   }
 
-  if (v8_mutex_init_) {
-    uv_mutex_destroy(&v8_mutex_);
-    v8_mutex_init_ = false;
-  }
-
   if (sem_init_) {
     uv_sem_destroy(&goroutine_sem_);
     sem_init_ = false;
@@ -251,20 +229,14 @@ void Runtime::Shutdown() {
   if (scheduler_) scheduler_->Shutdown();
 }
 
-void Runtime::OnPrepare(uv_prepare_t* handle) {
-  Runtime* rt = static_cast<Runtime*>(handle->data);
-  uv_mutex_unlock(&rt->v8_mutex_);
-}
-
 void Runtime::OnCheck(uv_check_t* handle) {
   Runtime* rt = static_cast<Runtime*>(handle->data);
-  uv_mutex_lock(&rt->v8_mutex_);
 
   uintptr_t sp = reinterpret_cast<uintptr_t>(&sp);
   rt->isolate_->SetStackLimit(sp - (900 * 1024));
 
-  // Single-thread mode: M0 must drain goroutines.
-  // Multi-thread: workers handle goroutines — M0 only does callbacks.
+  // In single-thread mode (GOMAXPROCS=1) M0 runs all goroutines.
+  // In multi-thread mode workers own the goroutine queue; M0 stays out.
   if (rt->num_threads_ == 1) {
     rt->DrainRunQueue();
   }
@@ -303,6 +275,7 @@ void Runtime::NotifyGoroutineAvailable() {
     }
   } else {
     if (sem_init_) {
+      GTRACE("NotifyGoroutineAvailable: sem_post (num_threads=%u)", num_threads_);
       uv_sem_post(&goroutine_sem_);
     }
   }
@@ -310,4 +283,3 @@ void Runtime::NotifyGoroutineAvailable() {
 
 }  // namespace goroutine
 }  // namespace node
-

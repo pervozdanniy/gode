@@ -4,6 +4,8 @@
 
 #include "src/heap/heap.h"
 
+#include "src/execution/goroutine-gc-roots.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -4714,6 +4716,12 @@ void Heap::IterateRoots(RootVisitor* v, base::EnumSet<SkipRoot> options,
   // Iterate over pointers being held by inactive threads.
   isolate_->thread_manager()->Iterate(v);
   v->Synchronize(VisitorSynchronization::kThreadManager);
+
+  // GOROUTINE PATCH: Scan yielded goroutine stacks for live V8 object refs.
+  // Uses StackFrameIterator with saved ThreadLocalTop to walk goroutine mmap
+  // stacks and visit/update all interpreter register file pointers.
+  // Must run unconditionally (like thread_manager) so minor GC also scans them.
+  GoroutineGCRegistry::Get().IterateRoots(isolate_, v);
 
   // Visitors in this block only run when not serializing. These include:
   //

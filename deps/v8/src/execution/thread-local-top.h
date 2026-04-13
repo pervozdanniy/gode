@@ -88,6 +88,20 @@ class ThreadLocalTop {
 
   bool CallDepthIsZero() const { return last_api_entry_ == kNullAddress; }
 
+  // Iterate exception/message fields of every active v8::TryCatch handler
+  // on this thread's handler chain.
+  // ThreadLocalTop is a friend of v8::TryCatch, so access to private fields
+  // (next_, exception_, message_obj_) is legitimate here.
+  // Used by GoroutineGCRegistry::IterateRoots to keep yielded-goroutine
+  // TryCatch chains alive across GC.
+  template <typename Callback>
+  void ForEachTryCatchField(Callback callback) {
+    for (v8::TryCatch* block = try_catch_handler_; block != nullptr;
+         block = block->next_) {
+      callback(reinterpret_cast<Address*>(&block->exception_));
+      callback(reinterpret_cast<Address*>(&block->message_obj_));
+    }
+  }
   void Free();
 
   // Group fields updated on every CEntry/CallApiCallback/CallApiGetter call

@@ -17,8 +17,9 @@ class Runtime;
 
 // M (Machine) — OS thread that executes goroutines.
 //
-// GM model (no P): M has a thread id used to index into the scheduler's
-// per-thread local queues. V8 state is per-M (thread_local).
+// No v8_mutex: each M thread owns a LocalHeap that registers it with V8's GC
+// safepoint mechanism. Multiple Ms can be in V8 simultaneously (races are
+// acceptable until Phase 2 per-thread JIT cache is implemented).
 // M0 is the main thread. Worker Ms are OS threads.
 class M {
  public:
@@ -29,17 +30,12 @@ class M {
 
   G* current_g() const { return current_g_; }
 
-  // V8 per-M state lifecycle
+  // V8 per-M state lifecycle (per-M IsolateData copy for handles/LABs).
   void InitV8State(v8::Isolate* isolate);
   void DestroyV8State();
-  void ActivateV8State();
-  void DeactivateV8State();
 
   // Pick one runnable G and execute it on the calling thread.
   bool ExecuteOne(v8::Isolate* isolate);
-
-  // Check GC safepoint between goroutines (blocks if GC is in progress).
-  void CheckSafepoint();
 
   // Start / stop this M as a worker OS thread.
   void StartThread(Runtime* rt);
@@ -49,11 +45,12 @@ class M {
   uint32_t id_;
   G* current_g_ = nullptr;
 
-  // Per-M V8 state (opaque handle)
+  // Per-M V8 state (opaque GoroutinePState handle).
   void* v8_state_ = nullptr;
 
-  // GC safepoint entry for this M thread (registered with V8 GC).
-  void* safepoint_entry_ = nullptr;
+  // Per-M LocalHeap: registers this thread with V8 GC and sets
+  // Isolate::Current() so v8::Isolate::GetCurrent() works on worker threads.
+  void* local_heap_ = nullptr;
 
   // Worker thread state.
   Runtime* runtime_ = nullptr;
@@ -66,10 +63,9 @@ class M {
 
 // Runtime — global goroutine runtime.
 //
-// V8 execution is protected by v8_mutex_:
-//   • M0 holds the mutex while the event loop processes JS callbacks.
-//   • uv_prepare releases it  → worker Ms can run goroutines during epoll.
-//   • uv_check   reacquires it → M0 also drains the run queue.
+// No v8_mutex: worker M threads run goroutines in parallel with M0 and
+// each other. GC coordination is via per-M LocalHeap (safepoints).
+// Races on V8 internals are accepted until Phase 2 (per-thread JIT cache).
 class Runtime {
  public:
   static Runtime* GetInstance();
@@ -90,7 +86,6 @@ class Runtime {
   Runtime(const Runtime&) = delete;
   Runtime& operator=(const Runtime&) = delete;
 
-  static void OnPrepare(uv_prepare_t* handle);
   static void OnCheck(uv_check_t* handle);
   static void OnIdle(uv_idle_t* handle);
   static void OnAsync(uv_async_t* handle);
@@ -107,18 +102,12 @@ class Runtime {
   M* m0_ = nullptr;
 
   // Event-loop hooks.
-  uv_prepare_t prepare_handle_;
   uv_check_t check_handle_;
   uv_idle_t idle_handle_;
   uv_async_t async_handle_;
-  bool prepare_active_ = false;
   bool check_active_ = false;
   bool idle_active_ = false;
   bool async_init_ = false;
-
-  // V8 execution token — only one M in V8 at a time.
-  uv_mutex_t v8_mutex_;
-  bool v8_mutex_init_ = false;
 
   // Semaphore: posted when a goroutine becomes runnable.
   uv_sem_t goroutine_sem_;

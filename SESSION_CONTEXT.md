@@ -1,59 +1,95 @@
-# GODE — Go-style Goroutines for Node.js
+# GODE — Coroutines for Node.js (working name: goroutines → Phase 7 переименует в Co)
 
 ## Что это
-Форк Node.js с настоящими горутинами à la Go. JS-функции запускаются через
-`go(fn, ...args)` и исполняются конкурентно по модели GMP (Goroutine / Machine / Processor).
+Форк Node.js с настоящими корутинами. JS-функции запускаются через `go(fn)` и исполняются конкурентно на M тредах. Переключение — кооперативное через `yield()`.
 
-## Текущий статус — ✅ Phase 2.5: P-based scheduling (Release + Debug)
+## Следуем плану: plan.md
 
-### Что реализовано и работает
+---
 
-#### Phase 1 ✅ — Single-threaded, main thread
-- `go()` → создаёт G → scheduler queue → uv_check/uv_idle → Execute()
-- `v8_goroutine_thread = false` на main thread
+## Текущий статус
 
-#### Phase 1.5 ✅ — Boost.Context (cooperative yield)
-- `G::Execute` через `jump_fcontext(g0 → G)` на 64KB стеке
-- `goroutine_entry(transfer_t)` → Execute → jump обратно
-- `yield()` → `YieldG()` → re-schedule + jump_fcontext(G → g0)
-- `goid()` → `CurrentG()->goid()` через `thread_local G* tls_current_g`
-- V8 stack limit обновляется при входе/выходе из горутины
-- Per-G HandleScopeData save/restore (предотвращает handle overlap)
+| Фаза | Статус | Описание |
+|------|--------|----------|
+| 1.1 GC Safepoints | ✅ DONE | LocalHeap per M thread (Park/Unpark/Safepoint) |
+| 1.2 GC roots (yielded goroutines) | ✅ DONE | goroutine-gc-roots.cc, gc_state_ в G |
+| **GOMAXPROCS > 1 дедлок** | ✅ FIXED | ThreadLoop: unpark внутри GVL |
+| 1.3 SeqLock shape transitions | ❌ TODO | — |
+| 2 Per-thread JIT cache | ❌ TODO | пока без --jitless (JIT работает, но через GVL) |
+| 3 Goroutine runtime | ✅ mostly done | go/yield/goid/scheduler работают |
+| 4 Unified thread pool | ❌ TODO | — |
+| 5 Per-M uv_loop (netpoller) | ❌ TODO | — |
+| 6 Channels + sync | ⚠️ stub | blocking send/recv, select — TODO |
+| 7 Переименование в Co | ❌ TODO | в конце |
 
-#### Phase 2 ✅ — Multi-threaded (V8 execution token)
-- Worker M-threads: `M::StartThread` → `ThreadLoop`
-- V8 mutex: один M в V8 за раз
-- M0 releases mutex в `uv_prepare` (before epoll), reacquires в `uv_check`
-- Worker gets V8 during epoll_wait
-- `v8_goroutine_thread = true` на worker потоках
-- `isolate->Enter()/Exit()` на workers
+---
 
-#### Phase 2.5 ✅ — P-based scheduling
-- P с lock-free ring buffer (256 slots)
-- Per-P V8 state: IsolateData + HandleScopeImplementer
-- Activate/Deactivate при acquirep/releasep
-- V8 mutex сохраняется (Phase 2 serialization)
-- Все тесты проходят с GOMAXPROCS=1 и 4
+## Архитектура (актуальная)
+
+```
+Main Thread (M0):
+  event loop → epoll_wait
+             → uv_check: DrainRunQueue()
+               M0::ExecuteOne(): lock GVL → RunG → unlock GVL
+               (M0 — всегда Running, park/unpark не нужен)
+
+Worker Thread (M1..Mn):
+  LocalHeap starts Parked (GC-safe)
+  loop:
+    uv_sem_wait(goroutine_sem_)           ← ждём сигнала (Parked)
+    inner loop:
+      FindRunnable()                      ← поиск горутины (Parked, нет heap access)
+      lock GVL (g_v8_lock)               ← ждём GVL пока Parked → GC может работать
+      LocalHeap::Unpark()                ← становимся Running (внутри GVL)
+      RunG(g, isolate)                   ← исполнение JS
+      LocalHeap::Park()                  ← Parked (до unlock GVL)
+      unlock GVL                         ← другой M или GC могут продолжить
+      if g dead: delete g
+    end inner loop
+    uv_async_send(async_handle_)         ← будим event loop
+  end loop
+
+GC coordination:
+  LocalHeap::Park()   → GC-safe (любой момент)
+  LocalHeap::Unpark() → блокируется пока GC идёт
+  GVL гарантирует: только один M в состоянии Running одновременно
+  goroutine-gc-roots.cc → GC сканирует yielded горутины
+```
+
+**Ключевое решение GVL (g_v8_lock):**
+- Один глобальный мьютекс сериализует выполнение V8 между M тредами
+- Фикс дедлока: `unpark` вызывается **внутри** GVL, а не до захвата
+  - Раньше: unpark вне GVL → поток Running, ждёт GVL → GC deadlock
+  - Теперь: lock GVL (Parked) → unpark (Running) → RunG → park → unlock
+- Phase 2 (per-thread JIT) позволит убрать GVL совсем
 
 ---
 
 ## Реализованные файлы
 
 ### Node.js runtime (src/goroutine/)
-| Файл | Строк | Что делает |
-|------|-------|-----------|
-| g.h/g.cc | 86+127 | G struct: стек, функция, Execute, состояния, saved HSD |
-| runtime.h/runtime.cc | 129+287 | M struct + Runtime singleton, ThreadLoop, event loop hooks |
-| scheduler.h/scheduler.cc | 127+281 | P struct + Scheduler: local queue, global queue, work-stealing |
-| stack.h/stack.cc | 73+? | Stack allocator: mmap, guard pages, pool |
-| context.h/context.cc | 34+118 | Boost.Context wrapper: RunG, YieldG, HSD save/restore |
-| channel.h/channel.cc | 64+128 | Channel stub (mutex-based, блокировка TODO) |
+| Файл | Что делает |
+|------|-----------|
+| g.h / g.cc | G struct + gc_state_ (Park при yield, Unpark при resume) |
+| runtime.h / runtime.cc | M + Runtime: GVL (g_v8_lock), LocalHeap, ThreadLoop, event loop hooks |
+| scheduler.h / scheduler.cc | Local queue + global queue + work-stealing |
+| stack.h / stack.cc | mmap стеки с guard pages (64KB + guard page per goroutine) |
+| context.h / context.cc | RunG, YieldG с gc_park/gc_unpark (Boost.Context fcontext) |
+| channel.h / channel.cc | Channel stub (TrySend/TryRecv работают, blocking — TODO) |
 
 ### V8 патчи (deps/v8/src/execution/)
 | Файл | Что делает |
 |------|-----------|
 | goroutine-thread.h/cc | TLS флаг `v8_goroutine_thread` |
-| goroutine-thread-state.h/cc | Per-P V8 state: create/activate/deactivate/destroy, HSD save/restore |
+| goroutine-thread-state.h/cc | Per-M IsolateData copy (HSD, LABs, StackGuard) |
+| goroutine-gc-roots.h/cc | GC root scanning для yielded горутин |
+| goroutine-local-heap.h/cc | LocalHeap C API (create/park/unpark/safepoint/destroy) |
+
+### V8 патчи (deps/v8/src/heap/)
+| Файл | Изменение |
+|------|----------|
+| heap.cc | GoroutineGCRegistry::IterateRoots в IterateRoots() |
+| safepoint.cc | GoroutineSafepointRegistry удалён (LocalHeap заменяет) |
 
 ### JS API
 | Файл | Что делает |
@@ -62,241 +98,44 @@
 | lib/goroutine.js | Public API |
 | lib/internal/goroutine.js | Internal binding wrapper |
 
-### Другие V8 патчи (проверки отключены для goroutine threads)
-- `src/api/api.cc` — Skip Locker check
-- `src/handles/handles-inl.h` — Skip DCHECK
-- `src/execution/execution.cc` — Skip AllowJavascriptExecution check
-- `src/execution/isolate-data.h` — friend class GoroutineThreadState
-- `src/execution/stack-guard.h` — friend class GoroutineThreadState
-
----
-
-## Архитектура (текущая)
-
-```
-Main Thread (M0):
-  event loop → uv_prepare (release v8_mutex)
-                 → epoll_wait (workers run goroutines)
-               uv_check (reacquire v8_mutex)
-                 → GOMAXPROCS=1: DrainRunQueue
-                 → GOMAXPROCS>1: workers handle all
-
-Worker Thread (M1..Mn):
-  sem_wait → mutex_lock(v8_mutex) → ExecuteOne → mutex_unlock → sem_wait
-  ExecuteOne: FindRunnable(P) → RunG(g, isolate)
-  RunG: save g0 HSD → restore G HSD → SetStackLimit → jump_fcontext → back → save G HSD → restore g0 HSD
-
-Schedule(g): push to global queue → NotifyGoroutineAvailable
-FindRunnable(p): local queue → global steal → work-stealing from random P
-```
-
 ---
 
 ## Сборка и тесты
 
 ```bash
-# Release
-cd out/Release && ninja -j$(nproc)
-./out/Release/node test_stress.js
+cd /home/pervozdanniy/code/gode
 
-# Debug
-cd out/Debug && ninja -j$(nproc)
-./out/Debug/node test_stress.js
+# ./node — симлинк на out/Release/node
+ninja -C out/Release node
 
-# С несколькими P
-NODE_GOMAXPROCS=4 ./out/Release/node test_stress.js
+# Тесты (все проходят с GOMAXPROCS=1 и GOMAXPROCS=4)
+./node test_context_switch.js
+GOMAXPROCS=4 ./node test_context_switch.js
+GOMAXPROCS=4 ./node test/goroutine/test-goroutine-basic.js
+GOMAXPROCS=4 ./node test/goroutine/test-goroutine-many.js
+GOMAXPROCS=4 ./node test/goroutine/test-goroutine-goid.js
 ```
 
+---
+
 ## Ключевые решения
-- **V8 mutex** сериализует доступ к V8 (Phase 2, пока не убран)
-- **Per-P IsolateData**: каждый P имеет свою копию IsolateData (LABs, HandleScope, ThreadLocalTop)
-- **Per-G HSD save/restore**: HandleScopeData сохраняется/восстанавливается при context switch
-- **No user-visible locks**: data races — ответственность программиста (как в Go)
-- **Unrecovered panic = abort**: как в Go
+
+| Решение | Обоснование |
+|---------|------------|
+| **GVL (g_v8_lock)** | Сериализует V8 между M тредами; убрать после Phase 2 (per-thread JIT) |
+| **LocalHeap** | Регистрирует M треды в V8 GC safepoint без кастомного registry |
+| **unpark внутри GVL** | Фикс дедлока GOMAXPROCS>1: GC не застревает на safepoint пока M ждёт GVL |
+| **goroutine-gc-roots.cc** | GC обновляет указатели в стеках yielded горутин |
+| **Нет isolate->Enter()** | LocalHeap делает Isolate::SetCurrent() в конструкторе |
+| **Boost.Context (fcontext)** | Кооперативное переключение контекстов (CPU regs) |
+| **mmap стеки** | 64KB + guard page per goroutine |
 
 ---
 
-## Новая концепция (plan.md) — АНАЛИЗ И СРАВНЕНИЕ
+## Следующие шаги (по плану)
 
-### ═══════════════════════════════════════════
-### Фаза 1 плана: Патч V8 — общий heap
-### ═══════════════════════════════════════════
-
-**Что предлагает план:**
-1. GC Safepoints для внешних тредов (ExternalThreadRegistry, ~130 строк)
-2. GC не эвакуирует shared объекты (is_shared флаг, ~80 строк)
-3. SeqLock на shape transitions (version counter, ~150 строк)
-4. Shared String Table (мьютекс на internment, ~80 строк)
-
-**Текущее состояние:**
-- ❌ Ничего из этого НЕ реализовано
-- V8 mutex сериализует всё → GC проблемы пока не возникают
-- Для убирания mutex (true parallel) ВСЁ из Фазы 1 будет необходимо
-
-**Оценка:**
-- Это самая критичная и сложная часть — глубокие изменения V8 GC
-- Без этого невозможен настоящий параллелизм
-- ~440 строк нового кода в V8 heap/objects
-
-### ═══════════════════════════════════════════
-### Фаза 2 плана: Per-thread JIT cache
-### ═══════════════════════════════════════════
-
-**Что предлагает план:**
-1. PerThreadJitCache (per-thread Code objects, ~200 строк)
-2. Per-thread Feedback Vectors (~150 строк)
-3. Ignition per-thread call path (~80 строк)
-
-**Текущее состояние:**
-- ❌ НЕ реализовано
-- JIT/компиляция общая для всех тредов
-- V8 mutex делает это безопасным сейчас
-
-**Оценка:**
-- Нужно для true parallel — иначе deopt в одном треде крашит другой
-- ~430 строк нового кода в V8 compiler/interpreter
-
-### ═══════════════════════════════════════════
-### Фаза 3 плана: Goroutine runtime
-### ═══════════════════════════════════════════
-
-**Что предлагает план:**
-1. Goroutine struct (~200 строк)
-2. Горутинный стек в shared heap (~200 строк)
-3. Планировщик + work-stealing (~300 строк)
-4. JS API go() + Promise (~150 строк)
-
-**Что уже реализовано (совпадения):**
-- ✅ G struct с состояниями (Gidle/Grunnable/Grunning/Gwaiting/Gdead)
-- ✅ Stack allocator (64KB + guard page) — но через mmap, не shared heap
-- ✅ Планировщик с local queue + global queue + work-stealing
-- ✅ JS API go(), yield(), goid()
-- ✅ Boost.Context для context switching (fcontext)
-- ✅ Per-G HandleScopeData save/restore
-
-**Различия:**
-| Аспект | План | Текущее |
-|--------|------|---------|
-| Стеки | shared heap (GC-visible) | mmap (не GC-visible) |
-| Возврат значения | Promise | fire-and-forget (goid) |
-| Сохранение состояния | InterpreterRegisters | CPU regs (fcontext) |
-| Парковка | mcall-аналог | YieldG → jump_fcontext |
-| IO waiting | PendingIO + IOResult | нет |
-| Context | v8::Global<Context> per G | берём isolate->GetCurrentContext() |
-
-**Оценка:**
-- ~60% функциональности Фазы 3 уже реализовано
-- Основные gap: Promise API, IO integration, shared heap стеки
-
-### ═══════════════════════════════════════════
-### Фаза 4 плана: Unified Thread Pool
-### ═══════════════════════════════════════════
-
-**Что предлагает план:**
-1. Объединённый пул (goroutine + libuv tasks, ~200 строк)
-2. Динамический размер пула (~100 строк)
-3. libuv интеграция (~150 строк)
-
-**Текущее состояние:**
-- ⚠️ Частично: есть worker threads, но фиксированное число
-- M↔P привязка статична при создании (plan: динамическая)
-- libuv thread pool и goroutine workers — отдельные пулы
-- `entersyscall()`/`exitsyscall()` подготовлены, но не подключены
-
-**Оценка:**
-- Нужно объединить пулы и сделать динамический grow/shrink
-- entersyscall/exitsyscall нужно прокинуть в реальные syscall пути
-
-### ═══════════════════════════════════════════
-### Фаза 5 плана: Per-M uv_loop (netpoller)
-### ═══════════════════════════════════════════
-
-**Что предлагает план:**
-1. Per-M uv_loop инициализация (~80 строк)
-2. Регистрация fd горутины + парковка (~100 строк)
-3. IO ready callback + zero-copy read (~120 строк)
-4. Перерегистрация при миграции (~80 строк)
-
-**Текущее состояние:**
-- ❌ НЕ реализовано
-- Один uv_loop (main thread)
-- Workers не имеют своих event loops
-- Горутины не могут делать IO → нет автоматического yield на IO
-
-**Оценка:**
-- Критично для реальных приложений (net, fs, etc.)
-- Аналог Go netpoller
-
-### ═══════════════════════════════════════════
-### Фаза 6 плана: Channels и примитивы синхронизации
-### ═══════════════════════════════════════════
-
-**Что предлагает план:**
-1. Channel (lock-free ring buffer, SharedValue, ~250 строк)
-2. SharedMutex / RWMutex (~150 строк)
-3. select (~150 строк)
-
-**Текущее состояние:**
-- ⚠️ Channel stub (channel.h/cc): есть структура, TrySend/TryRecv работают
-- Blocking send/recv = TODO (printf "TODO: Block sender")
-- select = не реализован
-- SharedMutex / RWMutex = не реализованы
-
-**Оценка:**
-- Нужно переписать Channel на lock-free
-- Добавить блокировку горутины (не треда!) при send/recv
-- select — ключевая Go-фича
-
----
-
-## ИТОГО: Что переиспользуется из текущего кода
-
-### ✅ Полностью переиспользуется:
-1. **G struct** (g.h/g.cc) — ядро горутины
-2. **Boost.Context** — context switching (fcontext)
-3. **Stack allocator** (stack.h/cc) — mmap стеки с guard pages
-4. **Scheduler** (scheduler.h/cc) — local queue + global + work-stealing
-5. **JS binding** (goroutine_wrap.cc, lib/goroutine.js)
-6. **V8 TLS flag** (goroutine-thread.h/cc)
-7. **V8 per-P state** (goroutine-thread-state.h/cc) — IsolateData клонирование
-
-### ⚠️ Нужна доработка:
-1. **Runtime** (runtime.h/cc) — добавить per-M uv_loop, динамический пул
-2. **Channel** (channel.h/cc) — переписать на lock-free
-3. **M struct** — добавить entersyscall/exitsyscall wiring
-
-### ❌ Нужно написать с нуля (из плана):
-1. **GC safepoints** (V8 heap) — ~130 строк
-2. **GC shared object pinning** — ~80 строк
-3. **SeqLock shape transitions** — ~150 строк
-4. **Shared string table** — ~80 строк
-5. **Per-thread JIT cache** — ~430 строк
-6. **Per-M uv_loop (netpoller)** — ~380 строк
-7. **SharedMutex / RWMutex** — ~150 строк
-8. **select** — ~150 строк
-9. **Promise API для go()** — ~50 строк
-
----
-
-## Рекомендуемый порядок следующих шагов
-
-1. **Phase 3 → True Parallel V8** (убрать v8_mutex):
-   - GC safepoints
-   - Shared object pinning
-   - SeqLock
-   - Per-thread JIT
-   ⟹ после этого: убрать v8_mutex, N тредов в V8 одновременно
-
-2. **Netpoller (per-M uv_loop)**:
-   - Горутины могут делать IO
-   - Автоматический yield на IO
-   ⟹ после этого: горутины полезны для реальных задач
-
-3. **Channels + sync primitives**:
-   - Lock-free channels
-   - select
-   ⟹ после этого: Go-style concurrency patterns
-
-4. **Unified thread pool + dynamic sizing**:
-   - Объединить libuv и goroutine workers
-   - entersyscall/exitsyscall
+1. **Phase 1.3** — SeqLock на shape transitions (M тред читает map, main thread пишет)
+2. **Phase 2** — Per-thread JIT cache → убрать GVL (настоящий параллелизм)
+3. **Phase 5** — Per-M uv_loop (netpoller) → горутины делают IO
+4. **Phase 6** — Lock-free channels + select + SharedMutex
+5. **Phase 7** — Переименование: goroutine → coroutine, go() → Co.run()
