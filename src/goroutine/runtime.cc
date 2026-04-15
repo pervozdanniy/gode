@@ -6,6 +6,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+
 #define GTRACE(fmt, ...) \
   fprintf(stderr, "[GTRACE tid=%ld] " fmt "\n", \
           (long)syscall(SYS_gettid), ##__VA_ARGS__)
@@ -57,6 +58,7 @@ bool M::ExecuteOne(v8::Isolate* isolate) {
   current_g_ = g;
   g->SetState(GState::Grunning);
 
+  // M0 is the main thread — always Running, no LocalHeap park/unpark needed.
   RunG(g, isolate);
 
   current_g_ = nullptr;
@@ -110,6 +112,7 @@ void M::ThreadLoop() {
     // Inner loop: drain goroutines while available.
     int count = 0;
     while (running_.load()) {
+      // FindRunnable while Parked — no V8 heap access, GC-safe.
       Scheduler* sched = Scheduler::GetInstance();
       G* g = sched->FindRunnable(id_);
       if (!g) break;
@@ -120,10 +123,16 @@ void M::ThreadLoop() {
       current_g_ = g;
       g->SetState(GState::Grunning);
 
+      // Unpark: signals V8 heap access begins; GC must wait for safepoint.
+      // Workers can now run concurrently — pre-compilation on main thread
+      // guarantees Runtime_CompileLazy is never reached from goroutines.
       v8_goroutine_local_heap_unpark(local_heap_);
       GTRACE("Worker M(id=%u) running G%llu", id_, (unsigned long long)g->goid());
+
       RunG(g, isolate);
+
       GTRACE("Worker M(id=%u) G%llu done/yielded", id_, (unsigned long long)g->goid());
+      // Park: back to GC-safe state between goroutines.
       v8_goroutine_local_heap_park(local_heap_);
 
       current_g_ = nullptr;

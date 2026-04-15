@@ -14,6 +14,10 @@
 
 extern "C" void* v8_goroutine_gc_alloc();
 extern "C" void  v8_goroutine_gc_free(void* state);
+// Deep-compile all SFIs in the goroutine's script on the calling (main) thread
+// so worker M threads never trigger Runtime_CompileLazy concurrently.
+extern "C" void v8_goroutine_deep_compile_script(v8::Isolate* isolate,
+                                                  v8::Local<v8::Function> fn);
 
 namespace node {
 namespace goroutine {
@@ -31,6 +35,12 @@ G::G(v8::Isolate* isolate,
       stack_context_(nullptr) {
 
   if (!entry_func.IsEmpty()) {
+    // Deep pre-compile: compile ALL SharedFunctionInfos in the goroutine's
+    // script on the calling (main) thread before the goroutine is dispatched
+    // to a worker M thread. This guarantees Runtime_CompileLazy is never
+    // triggered from worker threads, making lock-free concurrent interpretation
+    // safe. The compilation is idempotent — already-compiled SFIs are skipped.
+    v8_goroutine_deep_compile_script(isolate, entry_func);
     entry_func_.Reset(isolate, entry_func);
   }
   if (!args.IsEmpty()) {

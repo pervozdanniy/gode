@@ -14,6 +14,7 @@
 #include "src/common/globals.h"
 #include "src/debug/debug.h"
 #include "src/diagnostics/code-tracer.h"
+#include "src/execution/goroutine-thread.h"  // v8_goroutine_thread TLS flag
 #include "src/execution/isolate-utils.h"
 #include "src/heap/combined-heap.h"
 #include "src/objects/shared-function-info-inl.h"
@@ -295,6 +296,11 @@ Tagged<DebugInfo> SharedFunctionInfo::GetDebugInfo(Isolate* isolate) const {
 
 std::optional<Tagged<DebugInfo>> SharedFunctionInfo::TryGetDebugInfo(
     Isolate* isolate) const {
+  // Goroutine worker threads never use debug-instrumented bytecode.
+  // Debug::TryGetDebugInfo accesses isolate-level debug structures without
+  // any locking — not safe to call from multiple threads concurrently.
+  // Worker threads use the non-instrumented active bytecode unconditionally.
+  if (v8_goroutine_thread) return {};
   return isolate->debug()->TryGetDebugInfo(*this);
 }
 

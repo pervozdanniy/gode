@@ -20,14 +20,14 @@
 #include "src/runtime/runtime-utils.h"
 
 // Goroutine worker thread safety: serialise lazy compilation.
-// Multiple M-threads share one Isolate, so Compiler::Compile (which uses
-// Isolate-level ReusableUnoptimizedCompileState) must not run concurrently.
-// Removed when Phase-2 per-thread JIT cache is implemented.
+// Compiler::Compile uses Isolate-level ReusableUnoptimizedCompileState which
+// is not thread-safe. The compile mutex ensures only one thread compiles at a
+// time. The crash in Debug::TryGetDebugInfo is separately fixed by skipping
+// it on goroutine worker threads (see shared-function-info-inl.h patch).
 #include <mutex>
 namespace {
 std::mutex g_compile_mutex;
 }  // namespace
-
 namespace v8::internal {
 
 namespace {
@@ -81,10 +81,10 @@ RUNTIME_FUNCTION(Runtime_CompileLazy) {
 #endif
   IsCompiledScope is_compiled_scope;
   {
-    // Serialise bytecode compilation across M worker threads.
-    // ReusableUnoptimizedCompileState on Isolate is not thread-safe.
-    // This lock is removed in Phase-2 (per-thread JIT cache).
-    std::unique_lock<std::mutex> compile_lock(g_compile_mutex);
+    // Serialise bytecode compilation: Isolate::ReusableUnoptimizedCompileState
+    // is not thread-safe. Goroutine worker threads may reach this path for
+    // functions in modules other than the pre-compiled entry script.
+    std::unique_lock<std::mutex> lock(g_compile_mutex);
     if (!Compiler::Compile(isolate, function, Compiler::KEEP_EXCEPTION,
                            &is_compiled_scope)) {
       return ReadOnlyRoots(isolate).exception();

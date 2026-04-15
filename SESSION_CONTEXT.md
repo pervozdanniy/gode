@@ -89,7 +89,7 @@ GC coordination:
 | Файл | Изменение |
 |------|----------|
 | heap.cc | GoroutineGCRegistry::IterateRoots в IterateRoots() |
-| safepoint.cc | GoroutineSafepointRegistry удалён (LocalHeap заменяет) |
+| safepoint.cc | без изменений (LocalHeap+IsolateSafepoint покрывают всё) |
 
 ### JS API
 | Файл | Что делает |

@@ -7,8 +7,6 @@
 #include <atomic>
 #include <vector>
 
-#include "src/execution/goroutine-safepoint.h"
-
 #include "src/base/logging.h"
 #include "src/base/platform/mutex.h"
 #include "src/common/globals.h"
@@ -48,14 +46,7 @@ void IsolateSafepoint::EnterLocalSafepointScope() {
   RunningLocalHeaps running_local_heaps;
   SetSafepointRequestedFlags(IncludeMainThread::kNo, running_local_heaps);
 
-  // Also stop goroutine M-threads (external threads not tracked by LocalHeap).
-  int external_running =
-      GoroutineSafepointRegistry::Get().RequestSafepoint();
-
   barrier_.WaitUntilRunningThreadsInSafepoint(running_local_heaps);
-
-  // Wait for goroutine M-threads to reach safepoint.
-  GoroutineSafepointRegistry::Get().WaitForAll(external_running);
 }
 
 class PerClientSafepointData final {
@@ -203,8 +194,6 @@ void IsolateSafepoint::LeaveLocalSafepointScope() {
   if (--active_safepoint_scopes_ == 0) {
     ClearSafepointRequestedFlags(IncludeMainThread::kNo);
     barrier_.Disarm();
-    // Resume goroutine M-threads.
-    GoroutineSafepointRegistry::Get().Resume();
   }
 
   local_heaps_mutex_.Unlock();

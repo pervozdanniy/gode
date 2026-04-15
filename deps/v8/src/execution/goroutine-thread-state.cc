@@ -13,6 +13,8 @@
 #include "src/api/api-inl.h"
 #include "src/codegen/compiler.h"
 #include "src/objects/js-function-inl.h"
+#include "src/objects/shared-function-info-inl.h"
+#include "src/objects/script.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -181,6 +183,41 @@ void v8_goroutine_restore_hsd(v8::Isolate* isolate, const void* buf) {
 void v8_goroutine_force_new_handle_block(v8::Isolate* isolate) {
   v8::internal::GoroutineThreadState::ForceNewHandleBlock(
       reinterpret_cast<v8::internal::Isolate*>(isolate));
+}
+
+// Deep-compile all SharedFunctionInfos in the same script as |fn|.
+// Must be called on the main thread before dispatching any goroutine worker.
+// After this call, Runtime_CompileLazy will never be triggered from goroutines.
+void v8_goroutine_deep_compile_script(v8::Isolate* isolate,
+                                      v8::Local<v8::Function> fn) {
+  using namespace v8::internal;
+  Isolate* i_isolate = reinterpret_cast<Isolate*>(isolate);
+
+  Handle<JSFunction> i_func =
+      Cast<JSFunction>(v8::Utils::OpenHandle(*fn));
+
+  // Step 1: compile the entry function itself.
+  {
+    IsCompiledScope scope;
+    Compiler::Compile(i_isolate, i_func,
+                      Compiler::CLEAR_EXCEPTION, &scope);
+  }
+
+  // Step 2: iterate every SFI in the same script and compile lazily.
+  Tagged<HeapObject> script_obj = i_func->shared()->script();
+  if (!IsScript(script_obj)) return;
+
+  Tagged<Script> script = Cast<Script>(script_obj);
+  SharedFunctionInfo::ScriptIterator iter(i_isolate, script);
+  for (Tagged<SharedFunctionInfo> sfi = iter.Next();
+       !sfi.is_null(); sfi = iter.Next()) {
+    if (!sfi->is_compiled()) {
+      Handle<SharedFunctionInfo> h(sfi, i_isolate);
+      IsCompiledScope scope;
+      Compiler::Compile(i_isolate, h,
+                        Compiler::CLEAR_EXCEPTION, &scope);
+    }
+  }
 }
 
 }  // extern "C"
