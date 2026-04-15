@@ -146,7 +146,6 @@ FullObjectSlot Arguments<T>::slot_from_address_at(int index, int offset) const {
                                                  Isolate* isolate);        \
   RUNTIME_ENTRY_WITH_RCS(Type, InternalType, Convert, Name)                \
   Type Name(int args_length, Address* args_object, Isolate* isolate) {     \
-    if (V8_UNLIKELY(::v8_goroutine_thread)) { isolate = Isolate::Current(); }   \
     DCHECK(isolate->context().is_null() || IsContext(isolate->context())); \
     CLOBBER_DOUBLE_REGISTERS();                                            \
     TEST_AND_CALL_RCS(Name)                                                \
