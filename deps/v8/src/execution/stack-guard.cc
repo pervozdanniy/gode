@@ -5,6 +5,7 @@
 #include "src/execution/stack-guard.h"
 
 #include "src/base/atomicops.h"
+#include "src/execution/goroutine-flag.h"
 #include "src/compiler-dispatcher/optimizing-compile-dispatcher.h"
 #include "src/execution/interrupts-scope.h"
 #include "src/execution/isolate.h"
@@ -310,6 +311,20 @@ Tagged<Object> StackGuard::HandleInterrupts(InterruptLevel level) {
   // Fetch and clear interrupt bits in one go. See comments inside the method
   // for special handling of TERMINATE_EXECUTION.
   int interrupt_flags = FetchAndClearInterrupts(level);
+
+  // GOROUTINE PATCH: M-threads must never initiate GC safepoints.
+  // Only the main thread is allowed to call StartIncrementalMarking,
+  // HandleGCRequest, etc. — these require IsolateSafepoint::EnterLocalSafepointScope()
+  // which would deadlock if called from a background LocalHeap thread while
+  // the main thread is already holding/waiting for the safepoint.
+  // Drop these flags silently — the main thread handles them via its own
+  // budget interrupt or IncrementalMarkingJob::Task.
+  if (v8_goroutine_thread) {
+    interrupt_flags &= ~(GC_REQUEST | START_INCREMENTAL_MARKING |
+                         GLOBAL_SAFEPOINT | DEOPT_MARKED_ALLOCATION_SITES |
+                         INSTALL_CODE | INSTALL_BASELINE_CODE |
+                         INSTALL_MAGLEV_CODE);
+  }
 
   // All interrupts should be fully processed when returning from this method.
   ShouldBeZeroOnReturnScope should_be_zero_on_return(&interrupt_flags);
