@@ -15,9 +15,7 @@
 #include "goroutine/g.h"
 #include "goroutine/context.h"
 
-#define GWRAP_TRACE(fmt, ...) \
-  fprintf(stderr, "[GWRAP  tid=%ld] " fmt "\n", \
-          (long)syscall(SYS_gettid), ##__VA_ARGS__)
+#define GWRAP_TRACE(fmt, ...) do {} while(0)
 
 namespace node {
 namespace goroutine_wrap {

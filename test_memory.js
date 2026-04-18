@@ -21,9 +21,12 @@ for (let i = 0; i < N; i++) {
     const id = goid();
     // const tid = threadid();
     // goprint('Goroutine', id, 'started');
-    let opa = getObj();
-    const fn = getFunc();
-    const topa = fn(opa);
+    for (let j = 0; j < 10000; j++) {
+      const opa = getObj();
+      const fn = getFunc();
+      const topa = fn(opa);
+    }
+
     // goprint('Goroutine', id, 'result:', JSON.stringify(topa));
     // goprint('Goroutine thread', tid);
   });

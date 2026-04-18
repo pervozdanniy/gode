@@ -608,9 +608,17 @@ Deoptimizer::Deoptimizer(Isolate* isolate, Tagged<JSFunction> function,
                        ? new CodeTracer::Scope(isolate->GetCodeTracer())
                        : nullptr) {
   if (isolate->deoptimizer_lazy_throw()) {
-    CHECK_EQ(kind, DeoptimizeKind::kLazy);
-    isolate->set_deoptimizer_lazy_throw(false);
-    deoptimizing_throw_ = true;
+    // GOROUTINE PATCH: deoptimizer_lazy_throw_ is shared Isolate state.
+    // On goroutine M-threads, another thread might have set it concurrently.
+    // Only apply the lazy-throw behavior if kind matches; otherwise clear the
+    // stale flag to prevent a false CHECK failure and a potential crash.
+    if (kind == DeoptimizeKind::kLazy) {
+      isolate->set_deoptimizer_lazy_throw(false);
+      deoptimizing_throw_ = true;
+    } else {
+      // Stale flag from another goroutine M-thread. Clear and continue.
+      isolate->set_deoptimizer_lazy_throw(false);
+    }
   }
 
   if (isolate->debug()->IsRestartFrameScheduled()) {

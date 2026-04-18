@@ -92,6 +92,10 @@ extern "C" {
 
   // Unpark: unregister goroutine from GC scanning.
   void v8_goroutine_gc_unpark(void* state);
+
+  // Set/clear TLS pointer to current goroutine's GC state.
+  // Call before jump_fcontext (with gc_state) and after return to g0 (nullptr).
+  void v8_goroutine_set_current_gc_state(void* state);
 }
 
 #endif  // V8_EXECUTION_GOROUTINE_GC_ROOTS_H_

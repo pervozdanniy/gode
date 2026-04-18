@@ -25,6 +25,15 @@
 #include "src/heap/parked-scope.h"
 #include "src/heap/safepoint.h"
 
+// GOROUTINE PATCH: GC safepoint hooks — register goroutine mmap stack as root
+// when GC fires mid-goroutine (M-thread parks without explicit YieldG).
+// Declarations are intentionally inline here (not via header include) to avoid
+// cascading recompilation through goroutine-flag.h → isolate.h → everything.
+extern thread_local __attribute__((tls_model("initial-exec"))) bool v8_goroutine_thread;
+namespace v8 { namespace internal { class Isolate; } }
+extern "C" void v8_goroutine_safepoint_park(v8::internal::Isolate* isolate);
+extern "C" void v8_goroutine_safepoint_unpark();
+
 namespace v8 {
 namespace internal {
 
@@ -262,6 +271,12 @@ void LocalHeap::ParkSlowPath() {
       DCHECK(current_state.IsSafepointRequested());
       DCHECK(!current_state.IsCollectionRequested());
 
+      // GOROUTINE PATCH: If this M-thread is running a goroutine, register its
+      // mmap stack frames as GC roots before GC is allowed to run.
+      if (v8_goroutine_thread) {
+        v8_goroutine_safepoint_park(heap_->isolate());
+      }
+
       ThreadState old_state = state_.SetParked();
       CHECK(old_state.IsRunning());
       CHECK(old_state.IsSafepointRequested());
@@ -309,6 +324,10 @@ void LocalHeap::UnparkSlowPath() {
       DCHECK(!current_state.IsCollectionRequested());
 
       SleepInUnpark();
+      // After safepoint ends, unregister goroutine if it was registered.
+      if (v8_goroutine_thread) {
+        v8_goroutine_safepoint_unpark();
+      }
     }
   }
 }
@@ -369,6 +388,30 @@ void LocalHeap::SleepInSafepoint() {
   }
 
   TRACE_GC1(heap_->tracer(), scope_id, thread_kind);
+
+  // GOROUTINE PATCH: Goroutine M-threads run on mmap stacks, not on the OS
+  // "central stack" that ExecuteWithStackMarker requires. Use a direct path:
+  // register goroutine frames via GoroutineGCRegistry instead of the
+  // conservative stack marker mechanism, then park/wait/unpark directly.
+  if (v8_goroutine_thread) {
+    v8_goroutine_safepoint_park(heap_->isolate());
+
+    ThreadState old_state = state_.SetParked();
+    CHECK(old_state.IsRunning());
+    CHECK(old_state.IsSafepointRequested());
+
+    heap_->safepoint()->WaitInSafepoint();
+
+    {
+      std::optional<IgnoreLocalGCRequests> ignore_gc_requests;
+      if (is_main_thread()) ignore_gc_requests.emplace(heap());
+      Unpark();
+    }
+
+    // Idempotent: UnparkSlowPath may have already unregistered.
+    v8_goroutine_safepoint_unpark();
+    return;
+  }
 
   ExecuteWithStackMarker([this]() {
     // Parking the running thread here is an optimization. We do not need to

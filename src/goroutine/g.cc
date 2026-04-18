@@ -3,14 +3,9 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
-#include <sys/syscall.h>
-#include <unistd.h>
 #include "stack.h"
 #include "context.h"
 
-#define GTRACE_G(fmt, ...) \
-  fprintf(stderr, "[G      tid=%ld] " fmt "\n", \
-          (long)syscall(SYS_gettid), ##__VA_ARGS__)
 
 extern "C" void* v8_goroutine_gc_alloc();
 extern "C" void  v8_goroutine_gc_free(void* state);
@@ -68,20 +63,16 @@ void G::SetState(GState new_state) {
 }
 
 void G::Execute(v8::Isolate* isolate) {
-  GTRACE_G("Execute G%llu: isolate=%p", (unsigned long long)goid_, (void*)isolate);
   // No entry function → g0 (scheduler goroutine), nothing to run.
   if (entry_func_.IsEmpty()) {
     SetState(GState::Gdead);
     return;
   }
 
-  GTRACE_G("Execute G%llu: creating HandleScope", (unsigned long long)goid_);
   v8::HandleScope handle_scope(isolate);
-  GTRACE_G("Execute G%llu: HandleScope created", (unsigned long long)goid_);
 
   // Get the current V8 context.  On the main thread this is always valid.
   v8::Local<v8::Context> context = isolate->GetCurrentContext();
-  GTRACE_G("Execute G%llu: GetCurrentContext done, empty=%d", (unsigned long long)goid_, context.IsEmpty());
   if (context.IsEmpty()) {
     context = isolate->GetEnteredOrMicrotaskContext();
   }
@@ -90,17 +81,11 @@ void G::Execute(v8::Isolate* isolate) {
     return;
   }
 
-  GTRACE_G("Execute G%llu: entering context scope", (unsigned long long)goid_);
   v8::Context::Scope context_scope(context);
-  GTRACE_G("Execute G%llu: getting func/args", (unsigned long long)goid_);
 
-  GTRACE_G("Execute G%llu: before entry_func_.Get()", (unsigned long long)goid_);
   v8::Local<v8::Function> func = entry_func_.Get(isolate);
-  GTRACE_G("Execute G%llu: after entry_func_.Get(), func.IsEmpty()=%d", (unsigned long long)goid_, func.IsEmpty());
 
-  GTRACE_G("Execute G%llu: before args_.Get()", (unsigned long long)goid_);
   v8::Local<v8::Array> args_array = args_.Get(isolate);
-  GTRACE_G("Execute G%llu: after args_.Get()", (unsigned long long)goid_);
 
 
   uint32_t argc = args_array.IsEmpty() ? 0 : args_array->Length();

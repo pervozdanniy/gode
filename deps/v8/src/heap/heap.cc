@@ -6,6 +6,13 @@
 
 #include "src/execution/goroutine-gc-roots.h"
 
+// GOROUTINE PATCH: thread flag declared inline to avoid including
+// goroutine-flag.h (which cascades through isolate.h → everything).
+extern thread_local __attribute__((tls_model("initial-exec"))) bool v8_goroutine_thread;
+// GC safepoint hooks: register/unregister goroutine mmap stack as GC root.
+namespace v8 { namespace internal { class Isolate; } }
+extern "C" void v8_goroutine_safepoint_park(v8::internal::Isolate* isolate);
+extern "C" void v8_goroutine_safepoint_unpark();
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -1560,6 +1567,23 @@ void Heap::ResetOldGenerationAndGlobalAllocationLimit() {
 void Heap::CollectGarbage(AllocationSpace space,
                           GarbageCollectionReason gc_reason,
                           const v8::GCCallbackFlags gc_callback_flags) {
+  // GOROUTINE PATCH: Goroutine M-threads run on mmap stacks and must NOT
+  // trigger GC directly — only the main thread can run CollectGarbage.
+  // 1. Register goroutine's mmap stack frames as GC roots before GC runs.
+  //    c_entry_fp_ in the per-M TLT points to the CEntry frame where the
+  //    interpreter called into this C++ allocation path.
+  // 2. Delegate GC to the main thread via CollectGarbageFromAnyThread.
+  // 3. Unregister goroutine after GC completes.
+  if (v8_goroutine_thread) {
+    LocalHeap* goroutine_lh = LocalHeap::Current();
+    if (goroutine_lh) {
+      v8_goroutine_safepoint_park(isolate_);
+      CollectGarbageFromAnyThread(goroutine_lh, gc_reason);
+      v8_goroutine_safepoint_unpark();
+    }
+    return;
+  }
+
   CHECK(isolate_->IsOnCentralStack());
   DCHECK_EQ(resize_new_space_mode_, ResizeNewSpaceMode::kNone);
 

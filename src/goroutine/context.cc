@@ -4,12 +4,7 @@
 #include "runtime.h"
 #include <cstdint>
 #include <cstdio>
-#include <sys/syscall.h>
-#include <unistd.h>
 
-#define GCTX_TRACE(fmt, ...) \
-  fprintf(stderr, "[GCTX   tid=%ld] " fmt "\n", \
-          (long)syscall(SYS_gettid), ##__VA_ARGS__)
 
 // ---- Boost.Context fcontext C API (transfer_t version) ----
 // The actual ABI: jump_fcontext returns {fctx, data} in RAX+RDX,
@@ -33,6 +28,8 @@ extern "C" void v8_goroutine_restore_hsd(v8::Isolate* isolate, const void* buf);
 extern "C" void v8_goroutine_force_new_handle_block(v8::Isolate* isolate);
 extern "C" void v8_goroutine_gc_park(v8::Isolate* isolate, void* state);
 extern "C" void v8_goroutine_gc_unpark(void* state);
+// Set TLS pointer so local-heap.cc safepoint hooks can find goroutine gc_state.
+extern "C" void v8_goroutine_set_current_gc_state(void* state);
 // Phase 1.3: SeqLock — wait until no shape transition is in flight.
 extern "C" void v8_goroutine_shape_seqlock_wait();
 // Old-Space LAB sync: borrow LocalHeap LAB into per-M IsolateData before run,
@@ -55,7 +52,6 @@ static thread_local G* tls_current_g = nullptr;
 static void goroutine_entry(fctx_transfer_t t) {
   // t.fctx = scheduler (g0) context that jumped to us.
   // t.data = G* pointer.
-  GCTX_TRACE("goroutine_entry: entered");
   tls_sched_ctx = t.fctx;
   G* g = static_cast<G*>(t.data);
 
@@ -63,11 +59,8 @@ static void goroutine_entry(fctx_transfer_t t) {
   // New fcontext stacks have r13=0; we must set it before any V8 generated code.
   void* iso_data = v8_goroutine_get_isolate_data();
   __asm__ volatile("movq %0, %%r13" : : "r"(iso_data) : "r13");
-  GCTX_TRACE("goroutine_entry: G%llu, calling GetCurrent()", (unsigned long long)g->goid());
   v8::Isolate* iso = v8::Isolate::GetCurrent();
-  GCTX_TRACE("goroutine_entry: G%llu, isolate=%p, calling Execute()", (unsigned long long)g->goid(), (void*)iso);
   g->Execute(iso);
-  GCTX_TRACE("goroutine_entry: G%llu Execute() done", (unsigned long long)g->goid());
   g->SetState(GState::Gdead);
 
   // Return to scheduler.  Never returns.
@@ -83,32 +76,26 @@ void* InitContext(G* g, void* stack_top) {
 }
 
 void RunG(G* g, v8::Isolate* isolate) {
-  GCTX_TRACE("RunG: starting G%llu", (unsigned long long)g->goid());
 
   // ---- Save g0's V8 HandleScopeData ----
   char g0_hsd[64];
-  GCTX_TRACE("RunG: G%llu -> save_hsd", (unsigned long long)g->goid());
   v8_goroutine_save_hsd(isolate, g0_hsd);
-  GCTX_TRACE("RunG: G%llu -> save_hsd done", (unsigned long long)g->goid());
 
   // Restore G's saved HSD (resuming), or force a fresh handle block (new G).
   if (g->has_saved_hsd()) {
-    GCTX_TRACE("RunG: G%llu -> restore_hsd", (unsigned long long)g->goid());
     v8_goroutine_restore_hsd(isolate, g->saved_hsd_buf());
-    GCTX_TRACE("RunG: G%llu -> restore_hsd done", (unsigned long long)g->goid());
   } else {
-    GCTX_TRACE("RunG: G%llu -> force_new_handle_block", (unsigned long long)g->goid());
     v8_goroutine_force_new_handle_block(isolate);
-    GCTX_TRACE("RunG: G%llu -> force_new_handle_block done", (unsigned long long)g->goid());
   }
 
   // Set V8 stack limit for the goroutine's small stack.
   uintptr_t g_stack_bottom = reinterpret_cast<uintptr_t>(g->stack()->top());
-  GCTX_TRACE("RunG: G%llu -> SetStackLimit(%p)", (unsigned long long)g->goid(), (void*)g_stack_bottom);
   isolate->SetStackLimit(g_stack_bottom + 8192);
-  GCTX_TRACE("RunG: G%llu -> jump_fcontext (ctx=%p)", (unsigned long long)g->goid(), g->stack_context());
 
   tls_current_g = g;
+  // Register goroutine's GC state so local-heap.cc safepoint hooks can find
+  // it when GC fires mid-goroutine (without explicit YieldG).
+  v8_goroutine_set_current_gc_state(g->gc_state());
 
   v8_goroutine_lab_sync_before_run();
   fctx_transfer_t result = jump_fcontext(
@@ -116,11 +103,13 @@ void RunG(G* g, v8::Isolate* isolate) {
       static_cast<void*>(g));
   v8_goroutine_lab_sync_after_run();
 
+  // Back on g0 stack — goroutine is no longer running on this M-thread.
+  v8_goroutine_set_current_gc_state(nullptr);
+
   // Back on g0 stack.
   G* returned_g = static_cast<G*>(result.data);
   returned_g->SaveContext(result.fctx);
 
-  GCTX_TRACE("RunG: G%llu returned (state=%d)", (unsigned long long)returned_g->goid(), (int)returned_g->state());
 
   // ---- Save G's HSD, restore g0's ----
   v8_goroutine_save_hsd(isolate, returned_g->saved_hsd_buf());
@@ -138,7 +127,6 @@ void YieldG() {
   G* g = tls_current_g;
   if (!g) return;
 
-  GCTX_TRACE("YieldG: G%llu yielding...", (unsigned long long)g->goid());
 
   g->SetState(GState::Grunnable);
   Scheduler::GetInstance()->Schedule(g);

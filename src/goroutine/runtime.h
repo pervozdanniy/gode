@@ -19,10 +19,8 @@ class Runtime;
 
 // M (Machine) — OS thread that executes goroutines.
 //
-// No v8_mutex: each M thread owns a LocalHeap that registers it with V8's GC
-// safepoint mechanism. Multiple Ms can be in V8 simultaneously (races are
-// acceptable until Phase 2 per-thread JIT cache is implemented).
-// M0 is the main thread. Worker Ms are OS threads.
+// Main thread (M0) NEVER executes goroutines.
+// GOMAXPROCS = number of worker M-threads spawned.
 class M {
  public:
   explicit M(uint32_t id);
@@ -36,12 +34,7 @@ class M {
   void InitV8State(v8::Isolate* isolate);
   void DestroyV8State();
 
-  // Pick one runnable G and execute it on the calling thread.
-  bool ExecuteOne(v8::Isolate* isolate);
-
   // Start / stop this M as a worker OS thread.
-  // Shutdown uses two phases: SignalStop() all workers first, then JoinThread()
-  // all workers — to avoid the shared-semaphore deadlock (see runtime.cc).
   void StartThread(Runtime* rt);
   void SignalStop();   // Phase 1: set running_=false, wake via shared sem
   void JoinThread();  // Phase 2: wait for thread exit
@@ -67,10 +60,6 @@ class M {
 };
 
 // Runtime — global goroutine runtime.
-//
-// No v8_mutex: worker M threads run goroutines in parallel with M0 and
-// each other. GC coordination is via per-M LocalHeap (safepoints).
-// Races on V8 internals are accepted until Phase 2 (per-thread JIT cache).
 class Runtime {
  public:
   static Runtime* GetInstance();
@@ -97,9 +86,7 @@ class Runtime {
   Runtime& operator=(const Runtime&) = delete;
 
   static void OnCheck(uv_check_t* handle);
-  static void OnIdle(uv_idle_t* handle);
   static void OnAsync(uv_async_t* handle);
-  void DrainRunQueue();
 
   std::atomic<bool> initialized_{false};
   std::atomic<bool> shutdown_{false};
@@ -109,14 +96,10 @@ class Runtime {
   uv_loop_t* loop_ = nullptr;
   Scheduler* scheduler_ = nullptr;
 
-  M* m0_ = nullptr;
-
   // Event-loop hooks.
   uv_check_t check_handle_;
-  uv_idle_t idle_handle_;
   uv_async_t async_handle_;
   bool check_active_ = false;
-  bool idle_active_ = false;
   bool async_init_ = false;
 
   // Semaphore: posted when a goroutine becomes runnable.
@@ -148,4 +131,3 @@ class Runtime {
 
 #endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 #endif  // SRC_GOROUTINE_RUNTIME_H_
-

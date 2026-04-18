@@ -6,6 +6,14 @@
 
 #include <memory>
 
+// GOROUTINE PATCH: goroutine M-threads are on mmap stacks. ExecuteWhileParked
+// calls ExecuteWithStackMarker → SetMarkerForBackgroundThreadAndCallback which
+// uses GetStackStart() (OS thread stack start) as the segment bottom, but RSP
+// is on the goroutine mmap stack → invalid segment → SIGSEGV in conservative
+// GC stack scan. CollectionBarrier is a friend of LocalHeap, so we can call
+// Park()/Unpark() directly without ExecuteWithStackMarker.
+extern thread_local __attribute__((tls_model("initial-exec"))) bool v8_goroutine_thread;
+
 #include "src/base/platform/mutex.h"
 #include "src/base/platform/time.h"
 #include "src/common/globals.h"
@@ -116,6 +124,29 @@ bool CollectionBarrier::AwaitCollectionBackground(LocalHeap* local_heap) {
   }
 
   bool collection_performed = false;
+  // GOROUTINE PATCH: goroutine M-threads run on mmap stacks. ExecuteWhileParked
+  // → ExecuteWithStackMarker → SetMarkerForBackgroundThreadAndCallback uses
+  // GetStackStart() (OS thread stack bottom) but RSP is on the mmap stack →
+  // the registered segment spans invalid memory → SIGSEGV in conservative scan.
+  // CollectionBarrier is a friend of LocalHeap, so we park directly with
+  // Park()/Unpark() — no stack marker needed (GoroutineGCRegistry::IterateRoots
+  // provides the exact scan via ParkSlowPath hook instead).
+  if (v8_goroutine_thread) {
+    local_heap->Park();
+    {
+      base::MutexGuard guard(&mutex_);
+      while (block_for_collection_) {
+        if (shutdown_requested_) {
+          local_heap->Unpark();
+          return false;
+        }
+        cv_wakeup_.Wait(&mutex_);
+      }
+      collection_performed = collection_performed_;
+    }
+    local_heap->Unpark();
+    return collection_performed;
+  }
   local_heap->ExecuteWhileParked([this, &collection_performed]() {
     base::MutexGuard guard(&mutex_);
 
