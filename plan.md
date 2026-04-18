@@ -1,6 +1,6 @@
 ## Финальный план реализации
 
-> Последнее обновление: 2026-04-18
+> Последнее обновление: 2026-04-18 (factory.cc allocation fix)
 > Статусы: ✅ DONE | 🔨 IN PROGRESS (собрано, не протестировано) | ❌ KNOWN ISSUE | 📋 TODO
 
 ---
@@ -75,11 +75,27 @@ Runtime_CompileLazy никогда не вызывается из worker тре�
 ### Heap allocation routing через LocalHeap ✅ DONE
 
 ```
-Медленный путь аллокации перехвачен для worker тредов:
-  heap-allocator.cc    → Factory / C++ path  → LocalHeap::AllocateRawWith
-  runtime-internal.cc  → Runtime_Allocate*   → LocalHeap::AllocateRawWith
+Точка перехвата — factory.cc (НЕ V8 хедеры):
+  Factory::AllocateRaw / AllocateRawWithAllocationSite:
+    if (v8_goroutine_thread) → LocalHeap::Current()->AllocateRawWith
+    LAB sync: after_run перед вызовом, before_run после.
+    kYoung → kOld (background LocalHeap не имеет Young Space LAB).
 
-Горутины никогда не выделяют напрямую через HeapAllocator без блокировки.
+  heap-allocator.cc slow-path:
+    Если local_heap_->is_main_thread() И v8_goroutine_thread
+    → перехватываем и роутим в LocalHeap::Current()->AllocateRawOrFail.
+    Это отличает «main heap's allocator вызван из M-треда» от
+    «goroutine's LH allocator дошёл до slow-path».
+
+  runtime-internal.cc → Runtime_Allocate* → LocalHeap::AllocateRawWith
+
+Горутины никогда не трогают main thread LAB без синхронизации.
+
+Файлы: deps/v8/src/heap/factory.cc
+        deps/v8/src/heap/heap-allocator.cc
+
+Тест: 5000 горутин × new Array(40000) под GOMAXPROCS=1 --jitless
+  → множество Mark-Compact циклов → завершилось за ~8.6s без краша ✅
 ```
 
 ### Isolate* fix (CEntryStub) 🔨 IN PROGRESS
@@ -135,9 +151,14 @@ RUNTIME_FUNCTION_RETURNS_TYPE (arguments.h) исправляет isolate в на
 ### KI-2: Goroutine аллокации идут только в Old Space
 
 ```
-Проблема: LocalHeap background тредов не имеет Young Space LAB.
+Статус: KNOWN, не критично для корректности.
+
+Причина: LocalHeap background тредов не имеет Young Space LAB.
   Все горутинные аллокации → Old Space → повышенное давление на Major GC,
   Minor GC не очищает short-lived горутинные объекты.
+
+Текущее поведение: factory.cc роутит kYoung → kOld для M-тредов.
+  5000 горутин × 40K array → множество Mark-Compact → работает стабильно.
 
 Варианты решения:
   A) Исследовать Young Space поддержку в LocalHeap (есть в новых V8).
