@@ -25,6 +25,9 @@
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
 
+// GOROUTINE PATCH: TLS flag (global scope, defined in goroutine-thread.cc).
+#include "src/execution/goroutine-flag.h"
+
 namespace v8::internal {
 
 #include "torque-generated/src/objects/feedback-vector-tq-inl.inc"
@@ -509,6 +512,14 @@ Tagged<MaybeObject> NexusConfig::GetFeedback(Tagged<FeedbackVector> vector,
 void NexusConfig::SetFeedback(Tagged<FeedbackVector> vector, FeedbackSlot slot,
                               Tagged<MaybeObject> feedback,
                               WriteBarrierMode mode) const {
+  // GOROUTINE PATCH: Skip IC updates on goroutine M-threads.
+  // Multiple goroutine threads share the same global FeedbackVector.
+  // Concurrent writes to its slots would race — even though SynchronizedSet
+  // uses atomic store, the CONDITIONAL_WRITE_BARRIER modifies shared GC
+  // structures. Goroutine threads read the IC state warmed by the main thread
+  // but do not update it. Per-thread FeedbackVectors (Phase 2.2, per-M JIT)
+  // will allow independent IC learning per M-thread.
+  if (v8_goroutine_thread) return;
   DCHECK(can_write());
   vector->SynchronizedSet(slot, feedback, mode);
 }

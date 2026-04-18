@@ -28,7 +28,7 @@
 #include "src/common/ptr-compr.h"
 #include "src/common/thread-local-storage.h"
 #include "src/debug/interface-types.h"
-#include "src/execution/goroutine-thread.h"
+#include "src/execution/goroutine-flag.h"
 #include "src/execution/goroutine-thread-state.h"
 #include "src/execution/execution.h"
 #include "src/execution/futex-emulation.h"

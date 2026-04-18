@@ -555,11 +555,14 @@ MaybeObjectHandle NexusConfig::NewHandle(Tagged<MaybeObject> object) const {
 }
 
 void NexusConfig::SetFeedbackPair(Tagged<FeedbackVector> vector,
-                                  FeedbackSlot start_slot,
-                                  Tagged<MaybeObject> feedback,
-                                  WriteBarrierMode mode,
-                                  Tagged<MaybeObject> feedback_extra,
-                                  WriteBarrierMode mode_extra) const {
+                                   FeedbackSlot start_slot,
+                                   Tagged<MaybeObject> feedback,
+                                   WriteBarrierMode mode,
+                                   Tagged<MaybeObject> feedback_extra,
+                                   WriteBarrierMode mode_extra) const {
+  // GOROUTINE PATCH: Skip IC updates on goroutine M-threads.
+  // See NexusConfig::SetFeedback in feedback-vector-inl.h for details.
+  if (v8_goroutine_thread) return;
   CHECK(can_write());
   CHECK_GT(vector->length(), start_slot.WithOffset(1).ToInt());
   base::MutexGuard mutex_guard(isolate()->feedback_vector_access());

@@ -6,6 +6,7 @@
 #include "v8.h"
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -108,6 +109,24 @@ void Threadid(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(Number::New(isolate, static_cast<double>(tid)));
 }
 
+// goprint(...args) — goroutine-safe print.
+// Converts all arguments to strings (like console.log), enqueues the message,
+// and signals the main thread to flush. Safe to call from any goroutine thread.
+// The actual write() happens on the main thread — no libuv races.
+void Goprint(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+
+  std::string output;
+  for (int i = 0; i < args.Length(); i++) {
+    if (i > 0) output += ' ';
+    v8::String::Utf8Value str(isolate, args[i]);
+    if (*str) output += *str;
+  }
+  output += '\n';
+
+  goroutine::Runtime::GetInstance()->EnqueuePrint(std::move(output));
+}
+
 void Initialize(Local<Object> target,
                 Local<Value> unused,
                 Local<Context> context,
@@ -116,6 +135,7 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "yield", Yield);
   SetMethod(context, target, "goid", Goid);
   SetMethod(context, target, "threadid", Threadid);
+  SetMethod(context, target, "goprint", Goprint);
 }
 
 void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
@@ -123,6 +143,7 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(Yield);
   registry->Register(Goid);
   registry->Register(Threadid);
+  registry->Register(Goprint);
 }
 
 }  // namespace goroutine_wrap

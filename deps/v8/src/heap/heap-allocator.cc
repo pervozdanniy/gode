@@ -7,8 +7,11 @@
 #include "src/base/logging.h"
 #include "src/common/globals.h"
 #include "src/execution/isolate.h"
+// goroutine-flag.h include removed: goroutine slow-path intercept moved to
 #include "src/heap/heap-allocator-inl.h"
 #include "src/heap/heap-inl.h"
+#include "src/heap/local-heap.h"
+#include "src/heap/local-heap-inl.h"
 #include "src/logging/counters.h"
 
 namespace v8 {

@@ -278,7 +278,7 @@ Address* HandleScope::CreateHandle(Isolate* isolate, Address value) {
 #ifdef DEBUG
   // GOROUTINE PATCH: Skip thread-id check for M-threads (they have per-thread
   // HandleScopeData so handle creation is safe)
-  // v8_goroutine_thread declared in goroutine-thread.h (global scope, included via isolate.h)
+  // v8_goroutine_thread declared in goroutine-flag.h (global scope, included via isolate.h → goroutine-flag.h)
   if (!v8_goroutine_thread && !AllowHandleUsageOnAllThreads::IsAllowed()) {
     DCHECK(isolate->main_thread_local_heap()->IsRunning());
     DCHECK_WITH_MSG(

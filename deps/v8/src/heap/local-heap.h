@@ -411,6 +411,7 @@ class V8_EXPORT_PRIVATE LocalHeap {
   friend class IsolateSafepoint;
   friend class IsolateSafepointScope;
   friend class ParkedScope;
+  friend struct GoroutineLocalHeapHelper;
   friend class UnparkedScope;
 };
 

@@ -174,7 +174,7 @@ class V8_NODISCARD CallDepthScope {
     // Per-thread IsolateData makes ThreadLocalTop operations safe.
     // But Fire*Callback and microtask processing touch shared Isolate state,
     // so we skip those for M-threads.
-    // v8_goroutine_thread declared in goroutine-thread.h (global scope, included via isolate.h)
+    // v8_goroutine_thread declared in goroutine-flag.h (global scope, included via isolate.h → goroutine-flag.h)
     is_goroutine_thread_ = v8_goroutine_thread;
 
     isolate_->thread_local_top()->IncrementCallDepth<do_callback>(this);

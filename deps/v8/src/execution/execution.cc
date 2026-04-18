@@ -361,7 +361,7 @@ V8_WARN_UNUSED_RESULT MaybeHandle<Object> Invoke(Isolate* isolate,
 
   // GOROUTINE PATCH: Skip AllowJavascriptExecution check for M-threads.
   // Default behavior preserved for all other threads.
-  // v8_goroutine_thread declared in goroutine-thread.h (global scope)
+  // v8_goroutine_thread declared in goroutine-flag.h (global scope)
   if (!v8_goroutine_thread) {
     if (!AllowJavascriptExecution::IsAllowed(isolate)) {
       GRACEFUL_FATAL("Invoke in DisallowJavascriptExecutionScope");

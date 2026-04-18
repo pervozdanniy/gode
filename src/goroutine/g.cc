@@ -102,6 +102,7 @@ void G::Execute(v8::Isolate* isolate) {
   v8::Local<v8::Array> args_array = args_.Get(isolate);
   GTRACE_G("Execute G%llu: after args_.Get()", (unsigned long long)goid_);
 
+
   uint32_t argc = args_array.IsEmpty() ? 0 : args_array->Length();
   std::vector<v8::Local<v8::Value>> argv(argc);
   for (uint32_t i = 0; i < argc; i++) {

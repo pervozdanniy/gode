@@ -1,8 +1,254 @@
 ## Финальный план реализации
 
+> Последнее обновление: 2026-04-18
+> Статусы: ✅ DONE | 🔨 IN PROGRESS (собрано, не протестировано) | ❌ KNOWN ISSUE | 📋 TODO
+
 ---
 
-### Фаза 1: Патч V8 — общий heap
+## Текущая реализация (фундамент)
+
+### per-M IsolateData ✅ DONE
+
+```
+Каждый M-тред имеет клон IsolateData (memcpy + fix-up полей).
+Регистр r13 указывает на per-M копию → JIT fast path (LAB, roots,
+StackGuard, handle_scope_data) изолирован между тредами.
+
+Файл: deps/v8/src/execution/goroutine-thread-state.cc
+      → GoroutineThreadState::CreatePState / ActivatePState
+```
+
+### LocalHeap per-M ✅ DONE
+
+```
+Каждый M-тред создаёт LocalHeap(kBackground):
+  - Регистрируется в V8 IsolateSafepoint автоматически
+  - LocalHeap::Park()      → M тред GC-safe (между горутинами)
+  - LocalHeap::Unpark()    → M тред начинает исполнение
+  - LocalHeap::Safepoint() → кооперативная точка (~1ns fast path)
+  - Вызывает Isolate::SetCurrent() → заменяет isolate->Enter()
+
+Файл: deps/v8/src/execution/goroutine-local-heap.cc
+```
+
+### GVL ✅ УДАЛЁН (фаза 2 — параллельный V8 через per-M IsolateData)
+
+```
+GVL (g_v8_lock) был временным костылём для сериализации V8 между M тредами.
+Удалён: M треды работают параллельно через per-M IsolateData + LocalHeap.
+Параллельность безопасна для pre-compiled pure JS без мутации общих объектов.
+```
+
+### Isolate* fix (CEntryStub) ✅ DONE
+
+```
+yield() → gc_park(): сохраняет ThreadLocalTop (c_entry_fp цепочка V8 фреймов)
+                     регистрирует горутину в GoroutineGCRegistry
+GC IterateRoots() → обходит mmap-стек каждой yielded горутины,
+                    обновляет tagged-указатели in-place (эвакуация ОК)
+resume() → gc_unpark(): снимает регистрацию
+
+Файл: deps/v8/src/execution/goroutine-gc-roots.h/cc
+```
+
+### G struct, Scheduler, Runtime ✅ DONE
+
+```
+src/goroutine/g.h/cc        — G struct, Execute, HSD save/restore, gc_state
+src/goroutine/scheduler.cc  — local queues (256 слотов), global queue,
+                               work-stealing, schedtick (fairness каждые 61)
+src/goroutine/runtime.cc    — M threads, uv handles, two-phase shutdown
+src/goroutine/context.cc    — RunG / YieldG, fcontext switching
+src/goroutine/stack.h       — mmap стек 64 КБ (не shared heap)
+```
+
+### deep_compile_script ✅ DONE
+
+```
+Все SFI скрипта компилируются на main thread перед dispatch горутины.
+Runtime_CompileLazy никогда не вызывается из worker треда.
+
+Файл: deps/v8/src/execution/goroutine-thread-state.cc
+      → v8_goroutine_deep_compile_script
+```
+
+### Heap allocation routing через LocalHeap ✅ DONE
+
+```
+Медленный путь аллокации перехвачен для worker тредов:
+  heap-allocator.cc    → Factory / C++ path  → LocalHeap::AllocateRawWith
+  runtime-internal.cc  → Runtime_Allocate*   → LocalHeap::AllocateRawWith
+
+Горутины никогда не выделяют напрямую через HeapAllocator без блокировки.
+```
+
+### Isolate* fix (CEntryStub) 🔨 IN PROGRESS
+
+```
+Проблема: CEntryStub вычисляет Isolate* как r13 - kRootRegisterBias.
+  На worker треде r13 = per-M IsolateData → неверный указатель.
+
+```
+TLS v8_goroutine_real_isolate (goroutine-flag.h) хранит реальный Isolate*.
+RUNTIME_FUNCTION_RETURNS_TYPE (arguments.h) исправляет isolate в начале
+каждого runtime-вызова через: if (v8_goroutine_thread && v8_goroutine_real_isolate)
+  isolate = static_cast<Isolate*>(v8_goroutine_real_isolate);
+
+Файлы: deps/v8/src/execution/goroutine-flag.h
+        deps/v8/src/execution/goroutine-thread-state.cc
+        deps/v8/src/execution/arguments.h
+Статус: реализовано и активно (без GVL — критически важно).
+```
+
+### Old Space LAB sync ✅ DONE
+
+```
+Перед RunG:   LocalHeap Old Space LAB → per-M IsolateData
+              JIT fast path (bump pointer через r13) работает без slow path.
+После RunG / при YieldG: обновлённый top → обратно в LocalHeap.
+
+Файлы: deps/v8/src/execution/goroutine-thread-state.cc
+        src/goroutine/context.cc
+Статус: реализовано.
+```
+
+---
+
+## ❌ Known Issues (обязательно устранить)
+
+### KI-1: GC safepoint не доходит до worker тредов
+
+```
+Проблема: GC запрашивает safepoint, записывая jslimit = 0 в StackGuard
+  реального IsolateData. Worker треды читают StackGuard из per-M клона
+  → сигнал не доходит → долго работающая горутина блокирует GC.
+
+Решение: добавить LocalHeap::Safepoint() в M::ThreadLoop между горутинами.
+  Это встроенный механизм LocalHeap (~1ns если GC не ждёт):
+
+    // src/goroutine/runtime.cc → M::ThreadLoop, после RunG:
+    LocalHeap::Current()->Safepoint();
+
+Файл: src/goroutine/runtime.cc
+```
+
+### KI-2: Goroutine аллокации идут только в Old Space
+
+```
+Проблема: LocalHeap background тредов не имеет Young Space LAB.
+  Все горутинные аллокации → Old Space → повышенное давление на Major GC,
+  Minor GC не очищает short-lived горутинные объекты.
+
+Варианты решения:
+  A) Исследовать Young Space поддержку в LocalHeap (есть в новых V8).
+  B) Per-goroutine bump-pointer arena, сбрасываемая при GState::Gdead.
+     (безопаснее, не требует V8 изменений)
+```
+
+### KI-3: libuv I/O не thread-safe из горутин
+
+```
+Проблема: console.log, fs.*, net.* из worker тредов вызывают libuv
+  напрямую → data race, возможный crash.
+
+Текущий workaround: Runtime::EnqueuePrint + print_queue → main thread
+  разгребает в OnAsync.
+
+Полное решение: Фаза 4 (per-M uv_loop) + маршрутизация всех I/O запросов
+  через main loop (промежуточно) или per-M loops (финально).
+```
+
+### KI-4: GC не может прервать CPU-bound горутину изнутри
+
+```
+Проблема: GC пишет jslimit = kInterruptLimit в реальный IsolateData.
+  Worker треды читают jslimit из per-M клона → сигнал не доходит
+  → CPU-bound горутина (без yield) блокирует GC на произвольное время.
+  Особенно критично т.к. горутины используются именно для CPU-bound задач.
+
+Решение (три шага):
+
+  1. Глобальный список активных GoroutinePState* в GoroutineThreadState.
+     При ActivatePState → добавить в список (под мьютексом).
+     При DeactivatePState → удалить из списка.
+
+  2. Хук в IsolateSafepoint::RequestSafepointOperation (или Notify):
+     После записи в реальный IsolateData → вызвать
+     GoroutineThreadState::SignalAllMThreads() которая пишет
+     RequestInterrupt(kGCInterrupt) в per-M StackGuard каждого M.
+
+  3. Патч Runtime_StackGuard для goroutine тредов:
+     if (v8_goroutine_thread && LocalHeap::Current()->IsRunningWithSafepoint()) {
+       // GC ждёт — паркуем текущую горутину
+       v8_goroutine_gc_park(isolate, CurrentG()->gc_state());
+       LocalHeap::Current()->Park();
+       LocalHeap::Current()->Unpark();
+       v8_goroutine_gc_unpark(CurrentG()->gc_state());
+     }
+
+Затраты: ~1 атомарная проверка на каждый вызов функции в горутине.
+  (только при активном GC — иначе kInterruptLimit не выставлен)
+
+Файлы:
+  goroutine-thread-state.h/cc  — список активных p_states + SignalAllMThreads
+  deps/v8/src/execution/isolate-safepoint.cc  — хук (минимальное изменение)
+  deps/v8/src/runtime/runtime-stack-check.cc  — Runtime_StackGuard patch
+```
+
+### KI-5: Data race при небезопасном доступе к общим объектам
+
+```
+Проблема: если пользователь без явного мьютекса мутирует объект из горутины
+  одновременно с мэйн тредом (или другой горутиной), возможны:
+  - SIGSEGV (чтение битого указателя при одновременном shape transition)
+  - тихая корrupция данных (race на значение поля)
+
+  Пример:
+    // мэйн тред:
+    obj.b = 2;       // shape transition → новый Map объекта
+
+    // горутина (одновременно):
+    obj.a            // читает map pointer посередине записи → SIGSEGV
+
+Решение: перехват SIGSEGV в обработчике сигнала worker M-треда.
+
+  1. При старте каждого M-треда устанавливаем альтернативный стек (sigaltstack)
+     и обработчик SIGSEGV/SIGBUS.
+
+  2. В обработчике:
+     - Убеждаемся, что адрес падения лежит в куче V8 (heap bounds check).
+     - Если да → это скорее всего data race горутины.
+     - Вызываем uv_async_send в main loop с ошибкой типа
+       "DataRaceError: unsafe concurrent access to shared object in goroutine".
+
+  3. Main loop получает async событие и вызывает
+     process.emit('uncaughtException', err).
+     Это даёт пользователю стандартный хук Node.js для graceful shutdown
+     (логирование, flush, exit).
+
+  4. Горутина/M-тред завершается (longjmp из обработчика или pthread_exit).
+
+Ограничения:
+  - SIGSEGV из JIT-кода не всегда указывает на data race (может быть баг рантайма).
+  - После обработки состояние кучи может быть испорчено → process.exit() обязателен.
+  - Как и в оригинальном Node.js: uncaughtException — это "last resort",
+    после которого нужно перезапускать процесс.
+
+Файлы:
+  src/goroutine/runtime.cc  — установка sigaltstack + SA_ONSTACK при старте M
+  src/goroutine/runtime.cc  — SIGSEGV handler → uv_async_send → main loop
+  lib/goroutine.js          — emit('uncaughtException') или 'unhandledRejection'
+```
+
+
+---
+
+## Фаза 1: Патч V8 (продолжение)
+
+### 1.1 GC Safepoints ✅ DONE
+### 1.2 GC roots для mmap-стеков ✅ DONE
+
+### 1.3 SeqLock на shape transitions 📋 TODO
 
 **1.1 GC Safepoints для M тредов** ✅ DONE
 
@@ -58,30 +304,12 @@ goroutine-safepoint.h/cc — удалены.
 Тест: M тред держит pointer → GC не ломает pointer ✅
 ```
 
-**GVL (Global V8 Lock) + ThreadLoop дедлок-фикс** ✅ FIXED
+**GVL (Global V8 Lock) + ThreadLoop дедлок-фикс** ✅ УДАЛЁН
 
 ```
-Проблема: при GOMAXPROCS > 1 процесс зависал.
-  Старый порядок в ThreadLoop:
-    unpark() → (Running) → lock GVL → RunG → unlock → park
-  Deadlock: M тред в Running ждёт GVL → GC не может дождаться safepoint.
-
-Фикс (src/goroutine/runtime.cc — M::ThreadLoop):
-  Новый порядок:
-    FindRunnable() пока Parked  ← нет обращений к V8 heap, GC-safe
-    lock GVL                    ← ждём мьютекс пока Parked → GC работает
-    unpark()                    ← Running только внутри GVL
-    RunG()
-    park()                      ← Parked до release GVL
-    unlock GVL                  ← другой M или GC может продолжить
-
-  M0 (ExecuteOne) не меняется: main thread всегда Running,
-    park/unpark не нужны, просто lock GVL → RunG → unlock.
-
-GVL = static std::mutex g_v8_lock в runtime.cc.
-Убирается в Phase 2 (per-thread JIT cache делает параллельный V8 безопасным).
-
-Тест: GOMAXPROCS=4, context switch test → нет зависания ✅
+GVL удалён в фазе 2. M-треды выполняют V8 параллельно через per-M IsolateData.
+Deadlock был: unpark вне GVL → Running, ждёт GVL → GC deadlock.
+Больше не актуально — GVL нет.
 ```
 
 **1.3 SeqLock на shape transitions**

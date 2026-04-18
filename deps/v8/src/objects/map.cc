@@ -5,6 +5,9 @@
 #include "src/objects/map.h"
 
 #include <optional>
+#include <mutex>
+
+#include "src/execution/goroutine-shape-seqlock.h"
 
 #include "src/common/assert-scope.h"
 #include "src/common/globals.h"
@@ -1995,6 +1998,18 @@ DirectHandle<Map> Map::TransitionToDataProperty(
 
   DCHECK(IsUniqueName(*name));
   DCHECK(!map->is_dictionary_map());
+
+  // Goroutine thread safety: protect the check-and-create of Map transitions.
+  // Without this mutex, two goroutine workers can simultaneously find no
+  // existing transition, both create a new Map, and both insert it into the
+  // parent Map's transition array — corrupting it.  All threads (including the
+  // main thread) serialize here; cost is negligible since each transition is
+  // created exactly once and then cached (read-only, no locking needed).
+  v8_goroutine_map_transition_lock();
+  // RAII: ensure unlock on all return paths.
+  struct MapTransitionUnlocker {
+    ~MapTransitionUnlocker() { v8_goroutine_map_transition_unlock(); }
+  } unlocker;
 
   // Migrate to the newest map before storing the property.
   map = Update(isolate, map);

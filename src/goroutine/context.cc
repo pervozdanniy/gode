@@ -35,6 +35,12 @@ extern "C" void v8_goroutine_gc_park(v8::Isolate* isolate, void* state);
 extern "C" void v8_goroutine_gc_unpark(void* state);
 // Phase 1.3: SeqLock — wait until no shape transition is in flight.
 extern "C" void v8_goroutine_shape_seqlock_wait();
+// Old-Space LAB sync: borrow LocalHeap LAB into per-M IsolateData before run,
+// flush updated top back to LocalHeap after run.
+extern "C" void v8_goroutine_lab_sync_before_run();
+extern "C" void v8_goroutine_lab_sync_after_run();
+// Returns per-M IsolateData* — used to set kRootRegister (r13) on goroutine entry.
+extern "C" void* v8_goroutine_get_isolate_data();
 
 namespace node {
 namespace goroutine {
@@ -52,6 +58,11 @@ static void goroutine_entry(fctx_transfer_t t) {
   GCTX_TRACE("goroutine_entry: entered");
   tls_sched_ctx = t.fctx;
   G* g = static_cast<G*>(t.data);
+
+  // Set kRootRegister (r13) to per-M IsolateData so V8 fast paths work.
+  // New fcontext stacks have r13=0; we must set it before any V8 generated code.
+  void* iso_data = v8_goroutine_get_isolate_data();
+  __asm__ volatile("movq %0, %%r13" : : "r"(iso_data) : "r13");
   GCTX_TRACE("goroutine_entry: G%llu, calling GetCurrent()", (unsigned long long)g->goid());
   v8::Isolate* iso = v8::Isolate::GetCurrent();
   GCTX_TRACE("goroutine_entry: G%llu, isolate=%p, calling Execute()", (unsigned long long)g->goid(), (void*)iso);
@@ -99,9 +110,11 @@ void RunG(G* g, v8::Isolate* isolate) {
 
   tls_current_g = g;
 
+  v8_goroutine_lab_sync_before_run();
   fctx_transfer_t result = jump_fcontext(
       static_cast<fcontext_t>(g->stack_context()),
       static_cast<void*>(g));
+  v8_goroutine_lab_sync_after_run();
 
   // Back on g0 stack.
   G* returned_g = static_cast<G*>(result.data);
@@ -134,12 +147,21 @@ void YieldG() {
   // Park: snapshot goroutine's TLT onto gc_state so GC can scan its mmap
   // stack while it's yielded. Must happen BEFORE jump to scheduler.
   v8_goroutine_gc_park(v8::Isolate::GetCurrent(), g->gc_state());
+  // Flush LAB back to LocalHeap before yielding (goroutine stops touching heap).
+  v8_goroutine_lab_sync_after_run();
   // Jump back to scheduler (g0).
   fctx_transfer_t t = jump_fcontext(tls_sched_ctx, static_cast<void*>(g));
   // Goroutine resumes here (RunG called jump_fcontext back to us).
+  // Restore kRootRegister (r13) — may have been clobbered by scheduler context.
+  {
+    void* iso_data = v8_goroutine_get_isolate_data();
+    __asm__ volatile("movq %0, %%r13" : : "r"(iso_data) : "r13");
+  }
   // Phase 1.3: SeqLock — before touching V8 heap, ensure no shape transition
   // is in progress on the main thread. Spins with cpu_relax (fast path ~1ns).
   v8_goroutine_shape_seqlock_wait();
+  // Steal LocalHeap LAB again now that we're running.
+  v8_goroutine_lab_sync_before_run();
   // Unpark: remove from GC scanning registry — we're running again.
   v8_goroutine_gc_unpark(g->gc_state());
   // Update g0 context for next yield.

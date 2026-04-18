@@ -103,7 +103,7 @@ bool HandleBase::IsDereferenceAllowed() const {
   if (AllowHandleUsageOnAllThreads::IsAllowed()) return true;
 
   // GOROUTINE PATCH: Allow handle deref from M-threads
-  // v8_goroutine_thread declared in goroutine-thread.h (global scope, included via isolate.h)
+  // v8_goroutine_thread declared in goroutine-flag.h (global scope, included via isolate.h → goroutine-flag.h)
   if (v8_goroutine_thread) return true;
 
   LocalHeap* local_heap = isolate->CurrentLocalHeap();

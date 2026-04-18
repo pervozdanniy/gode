@@ -4,10 +4,15 @@
 
 #include "src/execution/goroutine-thread-state.h"
 
+#include "src/execution/goroutine-flag.h"
 #include "src/execution/isolate.h"
 #include "src/execution/isolate-data.h"
 #include "src/execution/stack-guard.h"
 #include "src/heap/linear-allocation-area.h"
+#include "src/heap/local-heap.h"
+#include "src/heap/local-heap-inl.h"
+#include "src/heap/main-allocator.h"
+#include "src/heap/main-allocator-inl.h"
 #include "src/objects/contexts-inl.h"
 #include "src/api/api.h"
 #include "src/api/api-inl.h"
@@ -15,7 +20,6 @@
 #include "src/objects/js-function-inl.h"
 #include "src/objects/shared-function-info-inl.h"
 #include "src/objects/script.h"
-
 #include <cstdlib>
 #include <cstring>
 
@@ -125,6 +129,40 @@ void GoroutineThreadState::ForceNewHandleBlock(Isolate* isolate) {
   hsd.next = hsd.limit;
 }
 
+void GoroutineThreadState::LabSyncBeforeRun() {
+  if (!g_active_p_state) return;
+  LocalHeap* lh = LocalHeap::Current();
+  if (!lh) return;
+  // Steal LocalHeap's Old Space LAB into per-M IsolateData so JIT
+  // bump-pointer fast path (r13-based) works without hitting slow path.
+  MainAllocator* old_alloc = lh->allocator()->old_space_allocator();
+  Address top   = *old_alloc->allocation_top_address();
+  Address limit = *old_alloc->allocation_limit_address();
+  g_active_p_state->isolate_data->old_allocation_info_.Reset(top, limit);
+}
+
+void GoroutineThreadState::LabSyncAfterRun() {
+  if (!g_active_p_state) return;
+  LocalHeap* lh = LocalHeap::Current();
+  if (!lh) return;
+  // Flush the JIT-updated top back to LocalHeap so it tracks consumption.
+  // IMPORTANT: only write back if per-M IsolateData top is within the LAB
+  // range AND is greater than LocalHeap's current top. If Ignition never
+  // used the LAB fast path (top == 0 because LAB was empty), writing 0
+  // would corrupt LocalHeap's allocator (top=0, limit=valid → next alloc
+  // succeeds with address 0 → SIGSEGV).
+  Address pstate_top = g_active_p_state->isolate_data->old_allocation_info_.top();
+  MainAllocator* old_alloc = lh->allocator()->old_space_allocator();
+  Address lh_top   = *old_alloc->allocation_top_address();
+  Address lh_limit = *old_alloc->allocation_limit_address();
+  if (pstate_top > lh_top && pstate_top <= lh_limit) {
+    *old_alloc->allocation_top_address() = pstate_top;
+  }
+  // Zero out IsolateData LAB so a stale limit can't be used after resume.
+  g_active_p_state->isolate_data->old_allocation_info_.Reset(
+      kNullAddress, kNullAddress);
+}
+
 }  // namespace internal
 }  // namespace v8
 
@@ -138,13 +176,15 @@ void* v8_goroutine_p_state_create(v8::Isolate* isolate) {
       v8::internal::GoroutineThreadState::CreatePState(i_isolate));
 }
 
-void v8_goroutine_p_state_activate(void* p_state) {
+void v8_goroutine_p_state_activate_with_isolate(void* p_state, v8::Isolate* isolate) {
+  v8_goroutine_real_isolate = static_cast<void*>(isolate);
   v8::internal::GoroutineThreadState::ActivatePState(
       static_cast<v8::internal::GoroutinePState*>(p_state));
 }
 
 void v8_goroutine_p_state_deactivate() {
   v8::internal::GoroutineThreadState::DeactivatePState();
+  v8_goroutine_real_isolate = nullptr;
 }
 
 void v8_goroutine_p_state_destroy(void* p_state) {
@@ -185,6 +225,14 @@ void v8_goroutine_force_new_handle_block(v8::Isolate* isolate) {
       reinterpret_cast<v8::internal::Isolate*>(isolate));
 }
 
+void v8_goroutine_lab_sync_before_run() {
+  v8::internal::GoroutineThreadState::LabSyncBeforeRun();
+}
+
+void v8_goroutine_lab_sync_after_run() {
+  v8::internal::GoroutineThreadState::LabSyncAfterRun();
+}
+
 // Deep-compile all SharedFunctionInfos in the same script as |fn|.
 // Must be called on the main thread before dispatching any goroutine worker.
 // After this call, Runtime_CompileLazy will never be triggered from goroutines.
@@ -218,6 +266,14 @@ void v8_goroutine_deep_compile_script(v8::Isolate* isolate,
                         Compiler::CLEAR_EXCEPTION, &scope);
     }
   }
+  // Step 3 (heap JSFunction scan) removed: now that HeapAllocator slow path
+  // routes through LocalHeap for goroutine threads, EnsureFeedbackVector and
+  // Runtime_InstallSFICode are safe to run on worker threads.
+}
+
+// Returns per-M IsolateData pointer (for setting r13 / kRootRegister).
+void* v8_goroutine_get_isolate_data() {
+  return v8::internal::GoroutineThreadState::GetIsolateData();
 }
 
 }  // extern "C"

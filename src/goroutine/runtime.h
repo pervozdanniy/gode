@@ -4,6 +4,8 @@
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
 #include <atomic>
+#include <mutex>
+#include <string>
 #include <vector>
 #include "uv.h"
 #include "v8.h"
@@ -38,8 +40,11 @@ class M {
   bool ExecuteOne(v8::Isolate* isolate);
 
   // Start / stop this M as a worker OS thread.
+  // Shutdown uses two phases: SignalStop() all workers first, then JoinThread()
+  // all workers — to avoid the shared-semaphore deadlock (see runtime.cc).
   void StartThread(Runtime* rt);
-  void StopThread();
+  void SignalStop();   // Phase 1: set running_=false, wake via shared sem
+  void JoinThread();  // Phase 2: wait for thread exit
 
  private:
   uint32_t id_;
@@ -80,6 +85,11 @@ class Runtime {
   // Wake worker M-threads after a goroutine is scheduled.
   void NotifyGoroutineAvailable();
 
+  // Goroutine-safe print: enqueue a message to be printed by the main thread.
+  // Safe to call from any goroutine worker thread.
+  // If called from the main thread (no active runtime), prints directly.
+  void EnqueuePrint(std::string msg);
+
  private:
   Runtime() = default;
   ~Runtime() = default;
@@ -112,6 +122,20 @@ class Runtime {
   // Semaphore: posted when a goroutine becomes runnable.
   uv_sem_t goroutine_sem_;
   bool sem_init_ = false;
+
+  // Number of worker M-threads currently blocked on uv_sem_wait.
+  // Used by NotifyGoroutineAvailable to avoid spurious sem_post.
+  std::atomic<int> sleeping_workers_{0};
+
+  // Print queue: goroutines enqueue here, main thread drains via OnAsync.
+  std::mutex print_mutex_;
+  std::vector<std::string> print_queue_;
+
+  // Dead goroutine queue: worker threads enqueue finished G* here instead of
+  // calling `delete g` directly. v8::Global::Reset() (in G::~G) is NOT
+  // thread-safe — it must run on the main thread which holds the V8 context.
+  std::mutex dead_mutex_;
+  std::vector<G*> dead_queue_;
 
   // Worker M-threads (M1, M2, …).
   std::vector<M*> workers_;

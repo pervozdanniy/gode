@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 #include "src/execution/isolate.h"
-#include "src/execution/goroutine-thread.h"  // GOROUTINE PATCH
+#include "src/execution/goroutine-flag.h"  // GOROUTINE PATCH
 
 #include <stdlib.h>
 

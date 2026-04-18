@@ -3,6 +3,13 @@
 #include "context.h"
 
 #include <cstdio>
+#include <mutex>
+#include <string>
+
+// Global V8 Lock — serialises concurrent goroutine execution until
+// per-thread JIT cache (Phase 2) makes true parallelism safe.
+// GVL removed: workers run V8 concurrently via per-M IsolateData + LocalHeap
+#include <vector>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -11,12 +18,9 @@
   fprintf(stderr, "[GTRACE tid=%ld] " fmt "\n", \
           (long)syscall(SYS_gettid), ##__VA_ARGS__)
 
-// V8 goroutine-thread TLS flag (defined in deps/v8/src/execution/goroutine-thread.cc)
-extern thread_local bool v8_goroutine_thread;
-
 // Per-M V8 IsolateData state (goroutine-thread-state.cc)
 extern "C" void* v8_goroutine_p_state_create(v8::Isolate* isolate);
-extern "C" void  v8_goroutine_p_state_activate(void* state);
+extern "C" void  v8_goroutine_p_state_activate_with_isolate(void* state, v8::Isolate* isolate);
 extern "C" void  v8_goroutine_p_state_deactivate();
 extern "C" void  v8_goroutine_p_state_destroy(void* state);
 
@@ -76,9 +80,17 @@ void M::StartThread(Runtime* rt) {
   uv_thread_create(&thread_, ThreadEntry, this);
 }
 
-void M::StopThread() {
-  if (!running_.exchange(false)) return;
-  uv_sem_post(&runtime_->goroutine_sem_);
+// Phase 1: mark this M as stopping and post to the shared sem to wake it.
+// MUST be called for ALL workers BEFORE joining ANY — because the semaphore
+// is shared. If we signal M1 then immediately join M1, another worker (M2)
+// might steal the sem_post, leaving M1 stuck in uv_sem_wait forever.
+void M::SignalStop() {
+  running_.store(false, std::memory_order_release);
+}
+
+// Phase 2: wait for this M to exit. Call only after SignalStop() has been
+// called for ALL workers.
+void M::JoinThread() {
   uv_thread_join(&thread_);
 }
 
@@ -94,7 +106,7 @@ void M::ThreadLoop() {
 
   // Create LocalHeap — starts Parked (GC-safe).
   local_heap_ = v8_goroutine_local_heap_create(isolate);
-  v8_goroutine_p_state_activate(v8_state_);
+  v8_goroutine_p_state_activate_with_isolate(v8_state_, isolate);
 
   // Link LocalHeap to per-M StackGuard so GC safepoints can interrupt this
   // goroutine worker thread's interpreter via RequestInterruptUnsafe().
@@ -104,7 +116,9 @@ void M::ThreadLoop() {
   while (running_.load()) {
     // ---- Parked: waiting for work signal (GC-safe) ----
     GTRACE("Worker M(id=%u) waiting on sem...", id_);
+    rt->sleeping_workers_.fetch_add(1, std::memory_order_relaxed);
     uv_sem_wait(&rt->goroutine_sem_);
+    rt->sleeping_workers_.fetch_sub(1, std::memory_order_relaxed);
     if (!running_.load()) break;
 
     GTRACE("Worker M(id=%u) woke up, draining queue", id_);
@@ -124,20 +138,20 @@ void M::ThreadLoop() {
       g->SetState(GState::Grunning);
 
       // Unpark: signals V8 heap access begins; GC must wait for safepoint.
-      // Workers can now run concurrently — pre-compilation on main thread
-      // guarantees Runtime_CompileLazy is never reached from goroutines.
       v8_goroutine_local_heap_unpark(local_heap_);
       GTRACE("Worker M(id=%u) running G%llu", id_, (unsigned long long)g->goid());
 
       RunG(g, isolate);
 
       GTRACE("Worker M(id=%u) G%llu done/yielded", id_, (unsigned long long)g->goid());
-      // Park: back to GC-safe state between goroutines.
       v8_goroutine_local_heap_park(local_heap_);
 
       current_g_ = nullptr;
       if (g->state() == GState::Gdead) {
-        delete g;
+        // v8::Global::~G() calls Reset() which is NOT thread-safe.
+        // Enqueue for deletion on main thread (drained in OnAsync).
+        std::lock_guard<std::mutex> lock(rt->dead_mutex_);
+        rt->dead_queue_.push_back(g);
       }
     }
 
@@ -148,6 +162,12 @@ void M::ThreadLoop() {
     }
   }
 
+  // ThreadLoop exiting. Destroy LocalHeap from THIS (worker) thread — required
+  // because LocalHeap::~LocalHeap() uses thread-local write barriers and
+  // Isolate::Current() that belong to this M thread.
+  // This is safe because Shutdown() calls SignalStop() for ALL workers first,
+  // then joins them all — so the main thread is NOT blocked waiting for us
+  // while we're here doing cleanup.
   v8_goroutine_p_state_deactivate();
   v8_goroutine_local_heap_destroy(local_heap_);
   local_heap_ = nullptr;
@@ -192,6 +212,7 @@ void Runtime::Init(uint32_t num_threads, uv_loop_t* loop,
 
   // uv_async: workers use this to wake the event loop.
   uv_async_init(loop_, &async_handle_, OnAsync);
+  async_handle_.data = this;
   uv_unref(reinterpret_cast<uv_handle_t*>(&async_handle_));
   async_init_ = true;
 
@@ -207,12 +228,33 @@ void Runtime::Init(uint32_t num_threads, uv_loop_t* loop,
 void Runtime::Shutdown() {
   if (!initialized_.load() || shutdown_.exchange(true)) return;
 
-  // Stop worker M-threads.
+  // Phase 1: mark ALL workers as stopped first (no sem_post yet).
+  // The goroutine_sem_ is shared — if we post once per worker, a wrong
+  // worker can steal the post, leaving the target stuck in uv_sem_wait.
   for (M* m : workers_) {
-    m->StopThread();
+    m->SignalStop();
+  }
+
+  // Phase 2: post num_threads wakeups — enough to wake every sleeping worker.
+  // Threads that get "extra" posts will simply loop, see running_=false, exit.
+  for (size_t i = 0; i < workers_.size(); i++) {
+    uv_sem_post(&goroutine_sem_);
+  }
+
+  // Phase 2: join all workers and clean up.
+  for (M* m : workers_) {
+    m->JoinThread();
     delete m;
   }
   workers_.clear();
+
+  // Drain any remaining dead goroutines (workers may have enqueued some
+  // after the last OnAsync fired but before they exited).
+  {
+    std::lock_guard<std::mutex> lock(dead_mutex_);
+    for (G* g : dead_queue_) delete g;
+    dead_queue_.clear();
+  }
 
   if (check_active_) {
     uv_check_stop(&check_handle_);
@@ -257,7 +299,43 @@ void Runtime::OnIdle(uv_idle_t* handle) {
 }
 
 void Runtime::OnAsync(uv_async_t* handle) {
-  // No-op. Wakes epoll so the event loop can process callbacks.
+  Runtime* rt = static_cast<Runtime*>(handle->data);
+
+  // Drain dead goroutine queue — delete G objects on main thread so that
+  // v8::Global::Reset() (in G::~G) runs with V8 context, not from worker.
+  std::vector<G*> dead;
+  {
+    std::lock_guard<std::mutex> lock(rt->dead_mutex_);
+    dead.swap(rt->dead_queue_);
+  }
+  for (G* g : dead) delete g;
+
+  // Drain the goroutine print queue on the main thread.
+  std::vector<std::string> local;
+  {
+    std::lock_guard<std::mutex> lock(rt->print_mutex_);
+    local.swap(rt->print_queue_);
+  }
+  for (const auto& msg : local) {
+    fwrite(msg.c_str(), 1, msg.size(), stdout);
+  }
+  if (!local.empty()) fflush(stdout);
+}
+
+void Runtime::EnqueuePrint(std::string msg) {
+  if (!async_init_) {
+    // Runtime not initialized (called from main thread before any go()).
+    // Print directly.
+    fwrite(msg.c_str(), 1, msg.size(), stdout);
+    fflush(stdout);
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(print_mutex_);
+    print_queue_.push_back(std::move(msg));
+  }
+  // uv_async_send is thread-safe by spec — safe to call from goroutine threads.
+  uv_async_send(&async_handle_);
 }
 
 void Runtime::DrainRunQueue() {
@@ -283,8 +361,9 @@ void Runtime::NotifyGoroutineAvailable() {
       idle_active_ = true;
     }
   } else {
-    if (sem_init_) {
-      GTRACE("NotifyGoroutineAvailable: sem_post (num_threads=%u)", num_threads_);
+    if (sem_init_ && sleeping_workers_.load(std::memory_order_relaxed) > 0) {
+      GTRACE("NotifyGoroutineAvailable: sem_post (num_threads=%u, sleeping=%d)",
+             num_threads_, sleeping_workers_.load());
       uv_sem_post(&goroutine_sem_);
     }
   }

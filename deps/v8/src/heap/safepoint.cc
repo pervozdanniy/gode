@@ -45,7 +45,6 @@ void IsolateSafepoint::EnterLocalSafepointScope() {
   barrier_.Arm();
   RunningLocalHeaps running_local_heaps;
   SetSafepointRequestedFlags(IncludeMainThread::kNo, running_local_heaps);
-
   barrier_.WaitUntilRunningThreadsInSafepoint(running_local_heaps);
 }
 

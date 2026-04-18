@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 
 // Global sequence counter.
 //   even  = no transition in flight (stable)
@@ -13,6 +14,15 @@
 //
 // Stored in its own cache line to avoid false sharing with other hot data.
 alignas(64) static std::atomic<uint32_t> g_shape_seq{0};
+
+// Global mutex for Map::TransitionToDataProperty.
+// Prevents concurrent goroutine workers from simultaneously creating duplicate
+// Map transitions and inserting them into the parent Map's transition array.
+// Both goroutine threads and the main thread take this mutex — so all Map
+// transition creations are serialized globally. Cost is negligible: transitions
+// only happen once per new shape, after which the cached transition is followed
+// (read-only, no mutex needed).
+static std::mutex g_map_transition_mutex;
 
 // Pause instruction — avoids saturating the store port during spin.
 // Defined for x86/x64; on ARM64 we use yield.
@@ -55,6 +65,14 @@ void v8_goroutine_shape_seqlock_wait() {
     cpu_relax();
     seq = g_shape_seq.load(std::memory_order_acquire);
   } while (seq & 1u);
+}
+
+void v8_goroutine_map_transition_lock() {
+  g_map_transition_mutex.lock();
+}
+
+void v8_goroutine_map_transition_unlock() {
+  g_map_transition_mutex.unlock();
 }
 
 }  // extern "C"

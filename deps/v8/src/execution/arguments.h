@@ -6,7 +6,7 @@
 #define V8_EXECUTION_ARGUMENTS_H_
 
 #include "src/execution/clobber-registers.h"
-#include "src/execution/goroutine-thread.h"
+#include "src/execution/goroutine-flag.h"
 #include "src/handles/handles.h"
 #include "src/logging/runtime-call-stats-scope.h"
 #include "src/objects/objects.h"
@@ -139,13 +139,15 @@ FullObjectSlot Arguments<T>::slot_from_address_at(int index, int offset) const {
 
 // GOROUTINE PATCH: fix wrong Isolate* on goroutine M-threads (CEntryStub computes
 // Isolate* = r13 - kRootRegisterBias = &per_M_isolate_data, not real Isolate).
-// v8_goroutine_thread declared in goroutine-thread.h (global namespace).
+// v8_goroutine_thread is available via goroutine-flag.h (included through isolate.h).
 
 #define RUNTIME_FUNCTION_RETURNS_TYPE(Type, InternalType, Convert, Name)   \
   static V8_INLINE InternalType __RT_impl_##Name(RuntimeArguments args,    \
                                                  Isolate* isolate);        \
   RUNTIME_ENTRY_WITH_RCS(Type, InternalType, Convert, Name)                \
   Type Name(int args_length, Address* args_object, Isolate* isolate) {     \
+    if (v8_goroutine_thread && v8_goroutine_real_isolate)                  \
+      isolate = static_cast<Isolate*>(v8_goroutine_real_isolate);          \
     DCHECK(isolate->context().is_null() || IsContext(isolate->context())); \
     CLOBBER_DOUBLE_REGISTERS();                                            \
     TEST_AND_CALL_RCS(Name)                                                \

@@ -40,6 +40,14 @@ extern "C" {
   // Called by M thread before resuming a goroutine.
   // Spins with cpu_relax until no write is in flight (seq is even).
   void v8_goroutine_shape_seqlock_wait();
+
+  // Mutex-based lock for Map transition creation (TransitionToDataProperty).
+  // Prevents goroutine-to-goroutine races where two workers simultaneously
+  // find no existing transition, both create a new Map, and both insert into
+  // the parent Map's transition array — corrupting it.
+  // Must be called by ALL callers of TransitionToDataProperty (any thread).
+  void v8_goroutine_map_transition_lock();
+  void v8_goroutine_map_transition_unlock();
 }
 
 #endif  // V8_EXECUTION_GOROUTINE_SHAPE_SEQLOCK_H_

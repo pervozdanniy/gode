@@ -18,6 +18,10 @@
 #include "src/objects/template-objects-inl.h"
 #include "src/runtime/runtime-utils.h"
 #include "src/utils/ostreams.h"
+#include "src/execution/goroutine-flag.h"
+#include "src/heap/local-heap.h"
+#include "src/heap/local-heap-inl.h"
+#include "src/objects/free-space-inl.h"
 
 namespace v8 {
 namespace internal {
@@ -437,6 +441,43 @@ RUNTIME_FUNCTION(Runtime_BytecodeBudgetInterruptWithStackCheck_Maglev) {
 }
 
 RUNTIME_FUNCTION(Runtime_AllocateInYoungGeneration) {
+  // GOROUTINE PATH: must be BEFORE HandleScope construction.
+  // If HandleScope is constructed first, the compiler merges its constructor
+  // with the goroutine branch (rax = LocalHeap* instead of Isolate*) → SIGSEGV.
+  // By returning here before HandleScope, the compiler keeps the paths separate.
+  //
+  // NOTE: `isolate` here is computed by CEntryStub as (r13 - kRootRegisterBias).
+  // On goroutine M-threads r13 = per-M IsolateData (not the real Isolate), so
+  // `isolate` is a garbage pointer. We MUST use Isolate::Current() instead.
+  if (v8_goroutine_thread) {
+    Isolate* const real_isolate = Isolate::Current();
+    LocalHeap* lh = LocalHeap::Current();
+    if (V8_LIKELY(lh != nullptr)) {
+      int size = ALIGN_TO_ALLOCATION_ALIGNMENT(args.smi_value_at(0));
+      int flags = args.smi_value_at(1);
+      (void)flags;
+      CHECK(IsAligned(size, kTaggedSize));
+      CHECK_GT(size, 0);
+      Tagged<HeapObject> obj =
+          lh->AllocateRawWith<HeapAllocator::kRetryOrFail>(
+              size, AllocationType::kOld, AllocationOrigin::kGeneratedCode,
+              kTaggedAligned);
+      // Initialize filler map directly — avoid shared-heap CreateFillerObjectAt
+      // which touches MemoryChunk counters (data race without GVL).
+      ReadOnlyRoots roots(real_isolate);
+      auto wfs = WritableFreeSpace::ForNonExecutableMemory(obj.address(), size);
+      if (size == kTaggedSize) {
+        HeapObject::SetFillerMap(wfs, roots.one_pointer_filler_map());
+      } else if (size == 2 * kTaggedSize) {
+        HeapObject::SetFillerMap(wfs, roots.two_pointer_filler_map());
+      } else {
+        HeapObject::SetFillerMap(wfs, roots.free_space_map());
+        FreeSpace::SetSize(wfs, size, kRelaxedStore);
+      }
+      return obj;
+    }
+  }
+
   HandleScope scope(isolate);
   DCHECK(isolate->IsOnCentralStack());
   DCHECK_EQ(2, args.length());
@@ -463,6 +504,37 @@ RUNTIME_FUNCTION(Runtime_AllocateInYoungGeneration) {
 }
 
 RUNTIME_FUNCTION(Runtime_AllocateInOldGeneration) {
+  // GOROUTINE PATH: before HandleScope — same reasoning as AllocateInYoungGeneration.
+  // NOTE: `isolate` here is garbage on goroutine M-threads (CEntryStub computes
+  // it as r13 - kRootRegisterBias, r13 = per-M IsolateData). Use Isolate::Current().
+  if (v8_goroutine_thread) {
+    Isolate* const real_isolate = Isolate::Current();
+    LocalHeap* lh = LocalHeap::Current();
+    if (V8_LIKELY(lh != nullptr)) {
+      int size = ALIGN_TO_ALLOCATION_ALIGNMENT(args.smi_value_at(0));
+      int flags = args.smi_value_at(1);
+      AllocationAlignment alignment =
+          AllocateDoubleAlignFlag::decode(flags) ? kDoubleAligned : kTaggedAligned;
+      CHECK(IsAligned(size, kTaggedSize));
+      CHECK_GT(size, 0);
+      Tagged<HeapObject> obj =
+          lh->AllocateRawWith<HeapAllocator::kRetryOrFail>(
+              size, AllocationType::kOld, AllocationOrigin::kGeneratedCode,
+              alignment);
+      ReadOnlyRoots roots(real_isolate);
+      auto wfs = WritableFreeSpace::ForNonExecutableMemory(obj.address(), size);
+      if (size == kTaggedSize) {
+        HeapObject::SetFillerMap(wfs, roots.one_pointer_filler_map());
+      } else if (size == 2 * kTaggedSize) {
+        HeapObject::SetFillerMap(wfs, roots.two_pointer_filler_map());
+      } else {
+        HeapObject::SetFillerMap(wfs, roots.free_space_map());
+        FreeSpace::SetSize(wfs, size, kRelaxedStore);
+      }
+      return obj;
+    }
+  }
+
   HandleScope scope(isolate);
   DCHECK_EQ(2, args.length());
   // TODO(v8:13070): Align allocations in the builtins that call this.
@@ -478,6 +550,7 @@ RUNTIME_FUNCTION(Runtime_AllocateInOldGeneration) {
       AllocateDoubleAlignFlag::decode(flags) ? kDoubleAligned : kTaggedAligned;
   CHECK(IsAligned(size, kTaggedSize));
   CHECK_GT(size, 0);
+
   return *isolate->factory()->NewFillerObject(
       size, alignment, AllocationType::kOld, AllocationOrigin::kGeneratedCode);
 }

@@ -9,14 +9,14 @@
 //
 // Lifecycle:
 //   Runtime::Init()  → v8_goroutine_p_state_create()   for each M
-//   M::ThreadLoop()  → v8_goroutine_p_state_activate()  when M starts running
+//   M::ThreadLoop()  → v8_goroutine_p_state_activate_with_isolate()  when M starts running
 //   M stops          → v8_goroutine_p_state_deactivate() when M finishes
 //   Runtime::Shutdown → v8_goroutine_p_state_destroy()  for each M
 
 #ifndef V8_EXECUTION_GOROUTINE_THREAD_STATE_H_
 #define V8_EXECUTION_GOROUTINE_THREAD_STATE_H_
 
-#include "src/execution/goroutine-thread.h"
+#include "src/execution/goroutine-flag.h"
 
 namespace v8 {
 namespace internal {
@@ -56,6 +56,12 @@ class GoroutineThreadState {
   static void RestoreHSD(Isolate* isolate, const void* buf);
   // Force next handle allocation into a fresh block (prevents overlap).
   static void ForceNewHandleBlock(Isolate* isolate);
+
+  // Old-Space LAB synchronisation around goroutine execution.
+  // LabSyncBeforeRun: steal LocalHeap LAB into per-M IsolateData so JIT fast path works.
+  // LabSyncAfterRun:  flush updated top back to LocalHeap, reset IsolateData LAB.
+  static void LabSyncBeforeRun();
+  static void LabSyncAfterRun();
 };
 
 }  // namespace internal

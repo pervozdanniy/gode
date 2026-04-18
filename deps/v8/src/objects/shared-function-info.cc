@@ -14,7 +14,7 @@
 #include "src/common/globals.h"
 #include "src/debug/debug.h"
 #include "src/diagnostics/code-tracer.h"
-#include "src/execution/goroutine-thread.h"  // v8_goroutine_thread TLS flag
+#include "src/execution/goroutine-flag.h"  // v8_goroutine_thread TLS flag
 #include "src/execution/isolate-utils.h"
 #include "src/heap/combined-heap.h"
 #include "src/objects/shared-function-info-inl.h"

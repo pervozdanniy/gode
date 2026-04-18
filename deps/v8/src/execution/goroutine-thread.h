@@ -2,8 +2,8 @@
 #ifndef V8_GOROUTINE_THREAD_H_
 #define V8_GOROUTINE_THREAD_H_
 
-// Set this to true in M-threads (goroutine worker threads)
-extern thread_local bool v8_goroutine_thread;
+// Actual declaration lives in the minimal goroutine-flag.h (no goroutine deps).
+#include "src/execution/goroutine-flag.h"
 
 #endif  // V8_GOROUTINE_THREAD_H_
 
