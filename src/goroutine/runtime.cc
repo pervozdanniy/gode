@@ -19,6 +19,8 @@ extern "C" void* v8_goroutine_p_state_create(v8::Isolate* isolate);
 extern "C" void  v8_goroutine_p_state_activate_with_isolate(void* state, v8::Isolate* isolate);
 extern "C" void  v8_goroutine_p_state_deactivate();
 extern "C" void  v8_goroutine_p_state_destroy(void* state);
+// Set per-M StackGuard limit (does NOT touch shared Isolate::stack_size_).
+extern "C" void  v8_goroutine_set_stack_limit(uintptr_t limit);
 
 // Per-M LocalHeap for GC safepoint coordination (goroutine-local-heap.cc).
 // LocalHeap also calls Isolate::SetCurrent() so v8::Isolate::GetCurrent()
@@ -80,11 +82,8 @@ void M::ThreadLoop() {
   // Create LocalHeap — starts Parked (GC-safe).
   local_heap_ = v8_goroutine_local_heap_create(isolate);
   v8_goroutine_p_state_activate_with_isolate(v8_state_, isolate);
-
-  // Link LocalHeap to per-M StackGuard so GC safepoints can interrupt this
-  // goroutine worker thread's interpreter via RequestInterruptUnsafe().
-  uintptr_t sp = reinterpret_cast<uintptr_t>(&sp);
-  isolate->SetStackLimit(sp - (900 * 1024));
+  // ActivatePState already set the per-M StackGuard limit from the current
+  // stack pointer. No need to call SetStackLimit again here.
 
   while (running_.load()) {
     // ---- Parked: waiting for work signal (GC-safe) ----
@@ -176,7 +175,7 @@ void Runtime::Init(uint32_t num_threads, uv_loop_t* loop,
   // Minimum is always 1 worker even if GOMAXPROCS=1.
   uint32_t num_workers = (num_threads > 0) ? num_threads : 1;
   for (uint32_t i = 0; i < num_workers; i++) {
-    M* m = new M(i + 1);
+    M* m = new M(i);  // 0-based: matches local_queues_[i]
     m->InitV8State(isolate);
     m->StartThread(this);
     workers_.push_back(m);
@@ -280,10 +279,12 @@ void Runtime::EnqueuePrint(std::string msg) {
 }
 
 void Runtime::NotifyGoroutineAvailable() {
-  // Always wake a worker thread — main thread never executes goroutines.
-  if (sem_init_ && sleeping_workers_.load(std::memory_order_relaxed) > 0) {
-    uv_sem_post(&goroutine_sem_);
-  }
+  if (!sem_init_) return;
+  // Always post — avoid startup race where workers haven't reached
+  // uv_sem_wait yet (sleeping_workers_ == 0) but goroutines are already
+  // queued. Spurious extra wakeups are harmless: workers drain the queue
+  // in the inner loop then go back to sleep immediately.
+  uv_sem_post(&goroutine_sem_);
 }
 
 }  // namespace goroutine

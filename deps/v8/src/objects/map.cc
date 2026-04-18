@@ -2108,6 +2108,12 @@ DirectHandle<Map> Map::TransitionToAccessorProperty(
                                        ? KEEP_INOBJECT_PROPERTIES
                                        : CLEAR_INOBJECT_PROPERTIES;
 
+  // Goroutine thread safety: same race as TransitionToDataProperty.
+  v8_goroutine_map_transition_lock();
+  struct MapTransitionUnlocker2 {
+    ~MapTransitionUnlocker2() { v8_goroutine_map_transition_unlock(); }
+  } unlocker;
+
   MaybeDirectHandle<Map> maybe_transition =
       TransitionsAccessor::SearchTransition(
           isolate, map, *name, PropertyKind::kAccessor, attributes);

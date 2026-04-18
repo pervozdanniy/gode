@@ -112,6 +112,7 @@ void GoroutineThreadState::DeactivatePState() {
   v8_goroutine_thread = false;
 }
 
+
 // ---- Per-G HandleScopeData helpers ----
 
 void GoroutineThreadState::SaveHSD(Isolate* isolate, void* buf) {
@@ -133,6 +134,19 @@ void GoroutineThreadState::LabSyncBeforeRun() {
   if (!g_active_p_state) return;
   LocalHeap* lh = LocalHeap::Current();
   if (!lh) return;
+
+  // Sync write-barrier marking flags from the main IsolateData to per-M
+  // IsolateData. These flags are set AFTER goroutine threads are created
+  // (concurrent marking starts at arbitrary times). If stale (= 0 when main
+  // has 1), goroutine write-barriers silently skip recording, objects are not
+  // traced by GC, and get freed → heap corruption → IsFunction() returns false.
+  Isolate* isolate = lh->heap()->isolate();
+  IsolateData* main_data = isolate->isolate_data();
+  g_active_p_state->isolate_data->is_marking_flag_ =
+      main_data->is_marking_flag_;
+  g_active_p_state->isolate_data->is_minor_marking_flag_ =
+      main_data->is_minor_marking_flag_;
+
   // Steal LocalHeap's Old Space LAB into per-M IsolateData so JIT
   // bump-pointer fast path (r13-based) works without hitting slow path.
   MainAllocator* old_alloc = lh->allocator()->old_space_allocator();
@@ -161,6 +175,14 @@ void GoroutineThreadState::LabSyncAfterRun() {
   // Zero out IsolateData LAB so a stale limit can't be used after resume.
   g_active_p_state->isolate_data->old_allocation_info_.Reset(
       kNullAddress, kNullAddress);
+}
+
+// Set per-M StackGuard stack limit without touching the shared
+// Isolate::stack_size_ field. Called via v8_goroutine_set_stack_limit().
+static void GoSetStackLimit(uintptr_t limit) {
+  if (!g_active_p_state) return;
+  StackGuard* sg = g_active_p_state->isolate_data->stack_guard();
+  sg->SetStackLimit(limit);
 }
 
 }  // namespace internal
@@ -236,44 +258,61 @@ void v8_goroutine_lab_sync_after_run() {
 // Deep-compile all SharedFunctionInfos in the same script as |fn|.
 // Must be called on the main thread before dispatching any goroutine worker.
 // After this call, Runtime_CompileLazy will never be triggered from goroutines.
+//
+// NOTE: We do NOT call Compiler::Compile(JSFunction) here (the old "Step 1").
+// That call allocates a FeedbackVector on the main heap using DirectHandles,
+// which is NOT safe while goroutine M-threads are Unparked (they can trigger
+// a minor GC via LocalHeap that moves new-space objects, leaving the main
+// thread's DirectHandle stale → SIGSEGV).
+// FeedbackVector initialisation is deferred to the first M-thread call of the
+// function; since M-threads use LocalHeap for allocation, that path is
+// properly GC-coordinated and safe.
 void v8_goroutine_deep_compile_script(v8::Isolate* isolate,
                                       v8::Local<v8::Function> fn) {
   using namespace v8::internal;
   Isolate* i_isolate = reinterpret_cast<Isolate*>(isolate);
 
+  // HandleScope is required: Compiler::Compile allocates, which can trigger
+  // GC (Mark-Compact when goroutine M-threads fill old space via LocalHeap).
+  // All raw tagged pointers must be in Handles before any allocation point.
+  HandleScope scope(i_isolate);
+
   Handle<JSFunction> i_func =
       Cast<JSFunction>(v8::Utils::OpenHandle(*fn));
 
-  // Step 1: compile the entry function itself.
-  {
-    IsCompiledScope scope;
-    Compiler::Compile(i_isolate, i_func,
-                      Compiler::CLEAR_EXCEPTION, &scope);
-  }
+  Tagged<HeapObject> script_raw = i_func->shared()->script();
+  if (!IsScript(script_raw)) return;
 
-  // Step 2: iterate every SFI in the same script and compile lazily.
-  Tagged<HeapObject> script_obj = i_func->shared()->script();
-  if (!IsScript(script_obj)) return;
+  // Hold Handle<Script> so GC keeps our reference current.
+  Handle<Script> script(Cast<Script>(script_raw), i_isolate);
 
-  Tagged<Script> script = Cast<Script>(script_obj);
-  SharedFunctionInfo::ScriptIterator iter(i_isolate, script);
+  // Use the Handle<WeakFixedArray> constructor of ScriptIterator —
+  // it stores the handle internally, so the infos array reference survives
+  // any GC triggered by Compiler::Compile allocations.
+  Handle<WeakFixedArray> infos(script->infos(), i_isolate);
+  SharedFunctionInfo::ScriptIterator iter(infos);
+
   for (Tagged<SharedFunctionInfo> sfi = iter.Next();
        !sfi.is_null(); sfi = iter.Next()) {
     if (!sfi->is_compiled()) {
       Handle<SharedFunctionInfo> h(sfi, i_isolate);
-      IsCompiledScope scope;
+      IsCompiledScope is_compiled_scope;
       Compiler::Compile(i_isolate, h,
-                        Compiler::CLEAR_EXCEPTION, &scope);
+                        Compiler::CLEAR_EXCEPTION, &is_compiled_scope);
     }
   }
-  // Step 3 (heap JSFunction scan) removed: now that HeapAllocator slow path
-  // routes through LocalHeap for goroutine threads, EnsureFeedbackVector and
-  // Runtime_InstallSFICode are safe to run on worker threads.
 }
 
 // Returns per-M IsolateData pointer (for setting r13 / kRootRegister).
 void* v8_goroutine_get_isolate_data() {
   return v8::internal::GoroutineThreadState::GetIsolateData();
+}
+
+// Set the per-M StackGuard stack limit WITHOUT touching the shared
+// Isolate::stack_size_ field. Use instead of v8::Isolate::SetStackLimit()
+// from goroutine M-threads.
+void v8_goroutine_set_stack_limit(uintptr_t limit) {
+  v8::internal::GoSetStackLimit(limit);
 }
 
 }  // extern "C"

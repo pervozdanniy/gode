@@ -95,6 +95,12 @@
 
 #include "src/heap/local-factory-inl.h"
 #include "src/heap/local-heap-inl.h"
+#include "src/execution/goroutine-flag.h"
+
+// LAB sync helpers — flush per-M IsolateData LAB top → LocalHeap before
+// delegating to goroutine's LocalHeap, re-steal after.
+extern "C" void v8_goroutine_lab_sync_after_run();
+extern "C" void v8_goroutine_lab_sync_before_run();
 
 namespace v8 {
 namespace internal {
@@ -290,6 +296,27 @@ Handle<Code> Factory::CodeBuilder::Build() {
 
 Tagged<HeapObject> Factory::AllocateRaw(int size, AllocationType allocation,
                                         AllocationAlignment alignment) {
+  // GOROUTINE PATCH: on M-threads, bypass main thread's HeapAllocator to avoid
+  // racing on the main thread's LAB (allocation_top). Route through goroutine's
+  // background LocalHeap which is thread-safe (uses its own LAB + OldLargeSpace
+  // with proper locking for large objects).
+  //
+  // We must flush the per-M IsolateData LAB (LabSyncAfterRun) before calling
+  // lh->AllocateRawWith so LocalHeap sees the correct top and doesn't hand out
+  // already-used memory. Re-steal the (possibly new) LAB after (LabSyncBeforeRun).
+  if (v8_goroutine_thread) {
+    LocalHeap* lh = LocalHeap::Current();
+    if (V8_LIKELY(lh && !lh->is_main_thread())) {
+      AllocationType lh_type = (allocation == AllocationType::kYoung)
+                                   ? AllocationType::kOld : allocation;
+      v8_goroutine_lab_sync_after_run();
+      Tagged<HeapObject> obj =
+          lh->AllocateRawWith<HeapAllocator::kRetryOrFail>(
+              size, lh_type, AllocationOrigin::kRuntime, alignment);
+      v8_goroutine_lab_sync_before_run();
+      return obj;
+    }
+  }
   return allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(
       size, allocation, AllocationOrigin::kRuntime, alignment);
 }
@@ -312,6 +339,21 @@ Tagged<HeapObject> Factory::AllocateRawWithAllocationSite(
   Tagged<HeapObject> result =
       allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(allocation_size,
                                                                 allocation);
+  // GOROUTINE PATCH: if on M-thread, bypass main heap allocator.
+  if (v8_goroutine_thread) {
+    LocalHeap* lh = LocalHeap::Current();
+    if (V8_LIKELY(lh && !lh->is_main_thread())) {
+      AllocationType lh_type = (allocation == AllocationType::kYoung)
+                                   ? AllocationType::kOld : allocation;
+      v8_goroutine_lab_sync_after_run();
+      result = lh->AllocateRawWith<HeapAllocator::kRetryOrFail>(
+          allocation_size, lh_type, AllocationOrigin::kRuntime);
+      v8_goroutine_lab_sync_before_run();
+    }
+  } else {
+    result = allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(
+        allocation_size, allocation);
+  }
   result->set_map_after_allocation(isolate(), *map, write_barrier_mode);
   if (should_allocate_memento) {
     const int aligned_size = ALIGN_TO_ALLOCATION_ALIGNMENT(instance_size);

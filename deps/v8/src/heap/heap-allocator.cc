@@ -7,12 +7,17 @@
 #include "src/base/logging.h"
 #include "src/common/globals.h"
 #include "src/execution/isolate.h"
-// goroutine-flag.h include removed: goroutine slow-path intercept moved to
+#include "src/execution/goroutine-flag.h"
 #include "src/heap/heap-allocator-inl.h"
 #include "src/heap/heap-inl.h"
 #include "src/heap/local-heap.h"
 #include "src/heap/local-heap-inl.h"
 #include "src/logging/counters.h"
+
+// LAB sync helpers from goroutine-thread-state.cc (extern "C").
+// Must be called with goroutine LAB in sync before/after LocalHeap operations.
+extern "C" void v8_goroutine_lab_sync_after_run();   // flush per-M top → LH
+extern "C" void v8_goroutine_lab_sync_before_run();  // steal LH LAB → per-M
 
 namespace v8 {
 namespace internal {
@@ -141,6 +146,32 @@ void HeapAllocator::CollectGarbage(AllocationType allocation) {
 AllocationResult HeapAllocator::AllocateRawWithRetryOrFailSlowPath(
     int size, AllocationType allocation, AllocationOrigin origin,
     AllocationAlignment alignment) {
+  // GOROUTINE PATCH: goroutine M-threads must not use the main thread's
+  // HeapAllocator (local_heap_->is_main_thread() == true). Route ALL
+  // allocations through the goroutine's background LocalHeap instead.
+  //
+  // Only intercept when THIS allocator IS the main thread's (local_heap_->
+  // is_main_thread()). When goroutine's own LH allocator calls us,
+  // local_heap_->is_main_thread() == false → fall through to normal slow-path
+  // (CollectGarbageFromAnyThread on goroutine's LH which is correct).
+  //
+  // Use AllocateRawOrFail so GC/retry is handled inside goroutine's LH
+  // (not the main thread's CollectAllAvailableGarbage which requires main thread).
+  if (v8_goroutine_thread && local_heap_->is_main_thread()) {
+    LocalHeap* lh = LocalHeap::Current();
+    if (lh && !lh->is_main_thread()) {
+      AllocationType lh_type = (allocation == AllocationType::kYoung)
+                                   ? AllocationType::kOld
+                                   : allocation;
+      if (lh_type == AllocationType::kOld ||
+          lh_type == AllocationType::kTrusted) {
+        v8_goroutine_lab_sync_after_run();
+        Address addr = lh->AllocateRawOrFail(size, lh_type, origin, alignment);
+        v8_goroutine_lab_sync_before_run();
+        return AllocationResult::FromObject(HeapObject::FromAddress(addr));
+      }
+    }
+  }
   auto Allocate = [&](AllocationType allocation) {
     return AllocateRaw(size, allocation, origin, alignment);
   };

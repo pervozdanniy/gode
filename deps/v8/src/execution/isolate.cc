@@ -3821,6 +3821,13 @@ void Isolate::IterateRegistersAndStackOfSimulator(
 
 #if V8_ENABLE_WEBASSEMBLY
 bool Isolate::IsOnCentralStack(Address addr) {
+  // GOROUTINE PATCH: Goroutine M-threads run on mmap stacks that are not the
+  // OS thread central stack, but they are NOT WASM secondary stacks either.
+  // Returning true prevents V8 from entering the WASM JSPI code path
+  // (iter.wasm_stack()->jslimit()) during exception unwinding, which would
+  // crash because no WasmStackMemory object exists for goroutine stacks.
+  if (v8_goroutine_thread) return true;
+
   auto stack = SimulatorStack::GetCentralStackView(this);
   Address stack_top = reinterpret_cast<Address>(stack.begin());
   Address stack_base = reinterpret_cast<Address>(stack.end());

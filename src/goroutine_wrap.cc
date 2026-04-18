@@ -50,8 +50,7 @@ void Go(const FunctionCallbackInfo<Value>& args) {
   if (!runtime->IsInitialized()) {
     uint32_t gomaxprocs = 1;
 
-    const char* env_gomaxprocs = getenv("NODE_GOMAXPROCS");
-    if (!env_gomaxprocs) env_gomaxprocs = getenv("GOMAXPROCS");
+    const char* env_gomaxprocs = getenv("GOMAXPROCS");
     if (env_gomaxprocs) {
       int parsed = atoi(env_gomaxprocs);
       if (parsed > 0 && parsed <= 256) {

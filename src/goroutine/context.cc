@@ -38,6 +38,8 @@ extern "C" void v8_goroutine_lab_sync_before_run();
 extern "C" void v8_goroutine_lab_sync_after_run();
 // Returns per-M IsolateData* — used to set kRootRegister (r13) on goroutine entry.
 extern "C" void* v8_goroutine_get_isolate_data();
+// Set per-M StackGuard stack limit directly (does NOT touch shared stack_size_).
+extern "C" void v8_goroutine_set_stack_limit(uintptr_t limit);
 
 namespace node {
 namespace goroutine {
@@ -88,9 +90,11 @@ void RunG(G* g, v8::Isolate* isolate) {
     v8_goroutine_force_new_handle_block(isolate);
   }
 
-  // Set V8 stack limit for the goroutine's small stack.
+  // Set stack limit for the goroutine's small mmap stack via per-M StackGuard.
+  // Use v8_goroutine_set_stack_limit (not isolate->SetStackLimit) to avoid
+  // corrupting the shared Isolate::stack_size_ field.
   uintptr_t g_stack_bottom = reinterpret_cast<uintptr_t>(g->stack()->top());
-  isolate->SetStackLimit(g_stack_bottom + 8192);
+  v8_goroutine_set_stack_limit(g_stack_bottom + 8192);
 
   tls_current_g = g;
   // Register goroutine's GC state so local-heap.cc safepoint hooks can find
@@ -118,9 +122,9 @@ void RunG(G* g, v8::Isolate* isolate) {
 
   tls_current_g = nullptr;
 
-  // Restore V8 stack limit for the caller's stack.
+  // Restore stack limit to M-thread's OS stack via per-M StackGuard.
   uintptr_t sp = reinterpret_cast<uintptr_t>(&result);
-  isolate->SetStackLimit(sp - (900 * 1024));
+  v8_goroutine_set_stack_limit(sp - (900 * 1024));
 }
 
 void YieldG() {
