@@ -33,6 +33,9 @@ extern thread_local __attribute__((tls_model("initial-exec"))) bool v8_goroutine
 namespace v8 { namespace internal { class Isolate; } }
 extern "C" void v8_goroutine_safepoint_park(v8::internal::Isolate* isolate);
 extern "C" void v8_goroutine_safepoint_unpark();
+// Sync per-M IsolateData roots_table_ from main after GC evacuation.
+// Must be called after every safepoint unpark, not just at goroutine start.
+extern "C" void v8_goroutine_lab_sync_before_run();
 
 namespace v8 {
 namespace internal {
@@ -327,6 +330,11 @@ void LocalHeap::UnparkSlowPath() {
       // After safepoint ends, unregister goroutine if it was registered.
       if (v8_goroutine_thread) {
         v8_goroutine_safepoint_unpark();
+        // Sync roots_table_ from main IsolateData: GC (MarkCompact) evacuates
+        // objects and updates main IsolateData's roots in-place. Per-M copy
+        // is stale until refreshed. Must happen after every safepoint, not only
+        // at goroutine start, because GC can fire mid-goroutine via AllocateRaw.
+        v8_goroutine_lab_sync_before_run();
       }
     }
   }
@@ -410,6 +418,8 @@ void LocalHeap::SleepInSafepoint() {
 
     // Idempotent: UnparkSlowPath may have already unregistered.
     v8_goroutine_safepoint_unpark();
+    // Sync roots after GC (see comment at the other unpark call site above).
+    if (v8_goroutine_thread) v8_goroutine_lab_sync_before_run();
     return;
   }
 

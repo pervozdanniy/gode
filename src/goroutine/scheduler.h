@@ -4,6 +4,7 @@
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
 #include <atomic>
+#include <deque>
 #include <vector>
 #include "g.h"
 #include "node_mutex.h"
@@ -94,7 +95,10 @@ class Scheduler {
 
   // Global runnable queue
   Mutex global_mutex_;
-  std::vector<G*> global_runq_;
+  std::deque<G*> global_runq_;
+
+  // Round-robin dispatch counter (used by Schedule() to distribute to local queues)
+  std::atomic<uint32_t> dispatch_tid_{0};
 
   // Runtime reference
   Runtime* runtime_ = nullptr;

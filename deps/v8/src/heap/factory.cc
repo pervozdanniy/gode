@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "src/heap/factory.h"
+#include "src/execution/goroutine-flag.h"
 
 #include <algorithm>  // For copy
 #include <memory>     // For shared_ptr<>
@@ -336,10 +337,10 @@ Tagged<HeapObject> Factory::AllocateRawWithAllocationSite(
           ? instance_size +
                 ALIGN_TO_ALLOCATION_ALIGNMENT(AllocationMemento::kSize)
           : instance_size;
-  Tagged<HeapObject> result =
-      allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(allocation_size,
-                                                                allocation);
-  // GOROUTINE PATCH: if on M-thread, bypass main heap allocator.
+  Tagged<HeapObject> result;
+  // GOROUTINE PATCH: on M-threads route through LocalHeap (same reason as
+  // Factory::AllocateRaw — avoid main-heap allocator races and safepoint
+  // deadlocks caused by StartIncrementalMarking on M-threads).
   if (v8_goroutine_thread) {
     LocalHeap* lh = LocalHeap::Current();
     if (V8_LIKELY(lh && !lh->is_main_thread())) {
@@ -349,6 +350,9 @@ Tagged<HeapObject> Factory::AllocateRawWithAllocationSite(
       result = lh->AllocateRawWith<HeapAllocator::kRetryOrFail>(
           allocation_size, lh_type, AllocationOrigin::kRuntime);
       v8_goroutine_lab_sync_before_run();
+    } else {
+      result = allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(
+          allocation_size, allocation);
     }
   } else {
     result = allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(
@@ -379,9 +383,27 @@ Tagged<HeapObject> Factory::New(DirectHandle<Map> map,
                                 AllocationType allocation) {
   DCHECK(map->instance_type() != MAP_TYPE);
   int size = map->instance_size();
-  Tagged<HeapObject> result =
-      allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(size,
-                                                                allocation);
+  Tagged<HeapObject> result;
+  // GOROUTINE PATCH: on M-threads route through LocalHeap to avoid racing
+  // on the main heap allocator and to prevent M-thread-initiated
+  // StartIncrementalMarking (which would deadlock with main-thread GC).
+  if (v8_goroutine_thread) {
+    LocalHeap* lh = LocalHeap::Current();
+    if (V8_LIKELY(lh && !lh->is_main_thread())) {
+      AllocationType lh_type = (allocation == AllocationType::kYoung)
+                                   ? AllocationType::kOld : allocation;
+      v8_goroutine_lab_sync_after_run();
+      result = lh->AllocateRawWith<HeapAllocator::kRetryOrFail>(
+          size, lh_type, AllocationOrigin::kRuntime);
+      v8_goroutine_lab_sync_before_run();
+    } else {
+      result = allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(
+          size, allocation);
+    }
+  } else {
+    result = allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(size,
+                                                                        allocation);
+  }
   // New space objects are allocated white.
   WriteBarrierMode write_barrier_mode = allocation == AllocationType::kYoung
                                             ? SKIP_WRITE_BARRIER
@@ -2318,9 +2340,14 @@ Handle<AllocationSite> Factory::NewAllocationSite(bool with_weak_next) {
   site->Initialize();
 
   if (with_weak_next) {
-    // Link the site
-    site->set_weak_next(isolate()->heap()->allocation_sites_list());
-    isolate()->heap()->set_allocation_sites_list(*site);
+    // Goroutine M-threads must NOT touch the global allocation_sites_list:
+    // concurrent prepend (non-atomic read-modify-write) creates a cycle in the
+    // weak linked list → MarkCompact loops forever in VisitWeakList.
+    // Skip linking — site still works for feedback, just not pretenured.
+    if (!v8_goroutine_thread) {
+      site->set_weak_next(isolate()->heap()->allocation_sites_list());
+      isolate()->heap()->set_allocation_sites_list(*site);
+    }
   }
   return site;
 }

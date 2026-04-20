@@ -9,9 +9,13 @@
 #include "src/objects/slots.h"
 #include "src/objects/visitors.h"
 #include "src/roots/roots.h"
+#include "src/api/api.h"  // HandleScopeImplementer::IterateThis
 
 #include <algorithm>
 #include <cstring>
+
+// Forward declaration: returns current M-thread's HSI (from goroutine-thread-state.cc).
+extern "C" void* v8_goroutine_get_current_hsi();
 
 namespace v8 {
 namespace internal {
@@ -43,13 +47,33 @@ void GoroutineGCRegistry::Free(GoroutineGCState* state) {
 }
 
 void GoroutineGCRegistry::Park(GoroutineGCState* state, Isolate* isolate) {
+  // Snapshot the current M-thread's HandleScopeImplementer.
+  // This captures all Handle<T> objects created in V8 runtime functions
+  // running on this goroutine M-thread (e.g. Handle<JSAny> receiver in
+  // Runtime_StoreIC_Miss). These handles are stored in the per-M HSI which
+  // is never visited by the main-thread GC via isolate->handle_scope_implementer()
+  // (that path returns the MAIN HSI, not per-M). Without visiting the per-M HSI,
+  // GC evacuation leaves handles stale → use-after-free → crash.
+  state->hsi = static_cast<v8::internal::HandleScopeImplementer*>(
+      v8_goroutine_get_current_hsi());
+
+  // Snapshot the per-M HandleScopeData.
+  // hsi->Iterate() calls isolate_->handle_scope_data() to get the active-block
+  // limit (current->next). On the GC main thread, isolate_->handle_scope_data()
+  // returns the MAIN thread's HSD — wrong block limit for the per-M HSI.
+  // We capture the per-M HSD here (Park runs on the M-thread where
+  // isolate->isolate_data() returns the per-M IsolateData) so IterateRoots()
+  // can temporarily swap it in before calling hsi->Iterate().
+  state->saved_hsd = *isolate->handle_scope_data();
+
   // Snapshot the current M-thread's ThreadLocalTop into goroutine's GC state.
   // c_entry_fp_ in the snapshot is the start of the goroutine's V8 frame chain
   // on its mmap stack — used by StackFrameIterator during GC.
   // isolate->thread_local_top() returns the per-M IsolateData TLT (due to
   // our patched isolate_data()) which holds the goroutine's c_entry_fp_.
-  std::memcpy(state->saved_tlt, isolate->thread_local_top(),
-              sizeof(ThreadLocalTop));
+  ThreadLocalTop* live = isolate->thread_local_top();
+  state->live_tlt = live;
+  std::memcpy(state->saved_tlt, live, sizeof(ThreadLocalTop));
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (state->yielded) return;  // Idempotent: already registered for GC.
@@ -63,9 +87,19 @@ void GoroutineGCRegistry::Unpark(GoroutineGCState* state) {
   if (!state->yielded) return;  // Idempotent: not registered.
   yielded_.erase(std::remove(yielded_.begin(), yielded_.end(), state),
                  yielded_.end());
+  // GC visited saved_tlt and updated all tagged pointer fields in-place.
+  // Copy those updated fields back to the live per-M TLT so the goroutine
+  // resumes with correct (post-GC) pointers instead of stale pre-GC addresses.
+  if (state->live_tlt && state->saved_tlt) {
+    state->live_tlt->context_         = state->saved_tlt->context_;
+    state->live_tlt->exception_       = state->saved_tlt->exception_;
+    state->live_tlt->pending_message_ = state->saved_tlt->pending_message_;
+  }
   // Zero out saved TLT so we don't hold stale pointers.
   std::memset(state->saved_tlt, 0, sizeof(ThreadLocalTop));
   state->yielded = false;
+  state->live_tlt = nullptr;
+  state->hsi = nullptr;
 }
 
 void GoroutineGCRegistry::IterateRoots(Isolate* isolate,
@@ -100,15 +134,33 @@ void GoroutineGCRegistry::IterateRoots(Isolate* isolate,
     });
 
     // 3. Walk all V8 interpreter frames on the goroutine's mmap stack.
-    //    StackFrameIterator uses tlt->c_entry_fp_ to find the frame chain.
-    //    frame->Iterate(visitor) visits AND updates (in-place) all tagged
-    //    pointers in interpreter register files — this is the critical fix
-    //    that prevents stale pointers after GC evacuation.
     if (tlt->c_entry_fp_ != kNullAddress) {
       StackFrameIterator it(isolate, tlt);
       for (; !it.done(); it.Advance()) {
         it.frame()->Iterate(visitor);
       }
+    }
+
+    // 4. Visit per-M HandleScopeImplementer handles.
+    //    hsi->Iterate(visitor) internally reads isolate_->handle_scope_data()
+    //    to know the limit of the current (last) handle block. On the GC main
+    //    thread, isolate_->handle_scope_data() returns the MAIN thread's HSD
+    //    with a completely different next/limit — wrong block boundary for the
+    //    per-M HSI's blocks. Without the swap, the last per-M block is scanned
+    //    with the wrong upper limit: handles allocated in it (e.g. the receiver
+    //    Handle<JSAny> in Runtime_StoreIC_Miss) are missed → stale after GC
+    //    evacuation → GetRootForNonJSReceiver crash.
+    //
+    //    Fix: temporarily replace the main isolate's handle_scope_data_ with
+    //    the per-M HSD snapshot taken at Park() time, call Iterate, then
+    //    restore. This is safe because GC runs under full safepoint (all
+    //    M-threads are stopped; no concurrent handle allocations).
+    if (state->hsi) {
+      HandleScopeData* main_hsd = isolate->handle_scope_data();
+      HandleScopeData saved_main = *main_hsd;
+      *main_hsd = state->saved_hsd;
+      state->hsi->Iterate(visitor);
+      *main_hsd = saved_main;
     }
   }
 }

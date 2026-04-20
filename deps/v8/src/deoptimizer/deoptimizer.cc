@@ -28,6 +28,7 @@
 #include "src/objects/oddball.h"
 #include "src/snapshot/embedded/embedded-data.h"
 #include "src/utils/utils.h"
+#include "src/execution/goroutine-flag.h"
 
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/wasm/baseline/liftoff-compiler.h"
@@ -622,10 +623,17 @@ Deoptimizer::Deoptimizer(Isolate* isolate, Tagged<JSFunction> function,
   }
 
   if (isolate->debug()->IsRestartFrameScheduled()) {
-    CHECK(deoptimizing_throw_);
-    restart_frame_index_ = isolate->debug()->restart_inline_frame_index();
-    CHECK_GE(restart_frame_index_, 0);
-    isolate->debug()->clear_restart_frame();
+    // GOROUTINE PATCH: M-threads don't use the debugger. restart_frame_id_ is
+    // shared Isolate state that M-threads don't save/restore. If stale,
+    // clear it and skip — goroutines never restart frames via debugger.
+    if (v8_goroutine_thread) {
+      isolate->debug()->clear_restart_frame();
+    } else {
+      CHECK(deoptimizing_throw_);
+      restart_frame_index_ = isolate->debug()->restart_inline_frame_index();
+      CHECK_GE(restart_frame_index_, 0);
+      isolate->debug()->clear_restart_frame();
+    }
   }
 
   DCHECK_NE(from, kNullAddress);

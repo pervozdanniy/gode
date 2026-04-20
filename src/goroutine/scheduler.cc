@@ -112,7 +112,21 @@ void Scheduler::Schedule(G* g) {
 
   g->SetState(GState::Grunnable);
 
-  // TODO: try to add to current thread's local queue first
+  // Try to push directly to a local queue (round-robin across M-threads).
+  // This avoids global queue contention and allows M-threads to pop O(1)
+  // from their own local queue without any mutex.
+  if (num_threads_ > 0) {
+    // Round-robin: cycle through all threads, try each once
+    uint32_t start = dispatch_tid_.fetch_add(1, std::memory_order_relaxed) % num_threads_;
+    for (uint32_t i = 0; i < num_threads_; i++) {
+      uint32_t tid = (start + i) % num_threads_;
+      if (local_queues_[tid]->Push(g)) {
+        return;
+      }
+    }
+  }
+
+  // All local queues full → fall back to global queue
   PushGlobal(g);
 }
 
@@ -194,7 +208,7 @@ G* Scheduler::PopGlobal() {
   if (global_runq_.empty()) return nullptr;
 
   G* g = global_runq_.front();
-  global_runq_.erase(global_runq_.begin());
+  global_runq_.pop_front();  // O(1) with deque
   return g;
 }
 
@@ -205,19 +219,15 @@ bool Scheduler::StealFromGlobal(uint32_t tid, uint32_t batch_size) {
   LocalQueue* lq = local_queues_[tid];
   uint32_t n = std::min(batch_size, static_cast<uint32_t>(global_runq_.size()));
 
+  uint32_t pushed = 0;
   for (uint32_t i = 0; i < n; i++) {
-    if (global_runq_.empty()) break;
-
     G* g = global_runq_.front();
-    global_runq_.erase(global_runq_.begin());
-
-    if (!lq->Push(g)) {
-      global_runq_.insert(global_runq_.begin(), g);
-      break;
-    }
+    if (!lq->Push(g)) break;
+    global_runq_.pop_front();  // O(1) with deque
+    pushed++;
   }
 
-  return true;
+  return pushed > 0;
 }
 
 }  // namespace goroutine

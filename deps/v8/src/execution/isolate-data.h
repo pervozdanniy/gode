@@ -531,6 +531,14 @@ class IsolateData final {
       builtin_dispatch_table_[JSBuiltinDispatchHandleRoot::kTableSize] = {};
 #endif  // V8_ENABLE_LEAPTIERING_BOOL && !V8_STATIC_DISPATCH_HANDLES_BOOL
 
+  // Per-M goroutine interrupt budget field removed — we now use FeedbackCell
+  // for all threads (original V8 behavior). Goroutines handle the interrupt
+  // in BytecodeBudgetInterrupt by resetting FeedbackCell to INT32_MAX/2.
+
+ public:
+  // Placeholder accessor kept for any remaining references — remove if unused.
+
+ private:
   // Ensure the size is 8-byte aligned in order to make alignment of the field
   // following the IsolateData field predictable. This solves the issue with
   // C++ compilers for 32-bit platforms which are not consistent at aligning

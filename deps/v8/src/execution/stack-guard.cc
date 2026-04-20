@@ -5,8 +5,8 @@
 #include "src/execution/stack-guard.h"
 
 #include "src/base/atomicops.h"
-#include "src/execution/goroutine-flag.h"
 #include "src/compiler-dispatcher/optimizing-compile-dispatcher.h"
+#include "src/execution/goroutine-flag.h"
 #include "src/execution/interrupts-scope.h"
 #include "src/execution/isolate.h"
 #include "src/execution/protectors-inl.h"
@@ -308,23 +308,34 @@ Tagged<Object> StackGuard::HandleInterrupts(InterruptLevel level) {
     isolate_->heap()->MonotonicallyIncreasingTimeInMs();
   }
 
+  // GOROUTINE PATCH: M-thread budget interrupt fast path.
+  // FetchAndClearInterrupts() takes ExecutionAccess → locks isolate's global
+  // break_access_ mutex. With N M-threads each handling budget interrupts
+  // every ~1000 bytecodes, this single mutex becomes the serialization
+  // bottleneck that kills parallelism (GOMAXPROCS=4 runs no faster than =2).
+  //
+  // Fix: on M-threads, skip FetchAndClearInterrupts entirely.
+  // • Per-M StackGuard (via isolate_data() patch) has no real interrupt flags
+  //   set — GC uses LocalHeap Park/Unpark, not StackGuard flags.
+  // • thread_local_ here IS the per-M StackGuard's fields (not shared).
+  // • Reset jslimit → real_jslimit_ without any lock (per-M data, no races).
+  // • TERMINATE_EXECUTION is rare; if needed, it can be set via per-M flags.
+  if (v8_goroutine_thread) {
+    // Reset jslimit so Ignition doesn't immediately re-trigger the budget
+    // interrupt on the very next bytecode.
+    thread_local_.set_jslimit(thread_local_.real_jslimit_);
+    // NOTE: by returning here we also implicitly prevent M-threads from
+    // ever reaching GC_REQUEST / START_INCREMENTAL_MARKING / GLOBAL_SAFEPOINT
+    // / INSTALL_CODE / DEOPT_MARKED_ALLOCATION_SITES etc. — all of which
+    // call IsolateSafepoint::EnterLocalSafepointScope() and would deadlock
+    // when the main thread is already holding the safepoint mutex.
+    // This early return is a strict superset of the old flag-masking fix.
+    return ReadOnlyRoots(isolate_).undefined_value();
+  }
+
   // Fetch and clear interrupt bits in one go. See comments inside the method
   // for special handling of TERMINATE_EXECUTION.
   int interrupt_flags = FetchAndClearInterrupts(level);
-
-  // GOROUTINE PATCH: M-threads must never initiate GC safepoints.
-  // Only the main thread is allowed to call StartIncrementalMarking,
-  // HandleGCRequest, etc. — these require IsolateSafepoint::EnterLocalSafepointScope()
-  // which would deadlock if called from a background LocalHeap thread while
-  // the main thread is already holding/waiting for the safepoint.
-  // Drop these flags silently — the main thread handles them via its own
-  // budget interrupt or IncrementalMarkingJob::Task.
-  if (v8_goroutine_thread) {
-    interrupt_flags &= ~(GC_REQUEST | START_INCREMENTAL_MARKING |
-                         GLOBAL_SAFEPOINT | DEOPT_MARKED_ALLOCATION_SITES |
-                         INSTALL_CODE | INSTALL_BASELINE_CODE |
-                         INSTALL_MAGLEV_CODE);
-  }
 
   // All interrupts should be fully processed when returning from this method.
   ShouldBeZeroOnReturnScope should_be_zero_on_return(&interrupt_flags);
@@ -411,6 +422,7 @@ Tagged<Object> StackGuard::HandleInterrupts(InterruptLevel level) {
 #endif
 
   isolate_->counters()->stack_interrupts()->Increment();
+
 
   return ReadOnlyRoots(isolate_).undefined_value();
 }

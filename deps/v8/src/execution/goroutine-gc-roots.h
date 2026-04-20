@@ -19,12 +19,15 @@
 #include <mutex>
 #include <vector>
 
+#include "src/handles/handles.h"  // HandleScopeData
+
 namespace v8 {
 class Isolate;
 namespace internal {
 class RootVisitor;
 class Isolate;
 class ThreadLocalTop;
+class HandleScopeImplementer;
 }  // namespace internal
 }  // namespace v8
 
@@ -39,6 +42,29 @@ struct GoroutineGCState {
   // Contains c_entry_fp_, context_, exception_, try_catch_handler_, etc.
   // nullptr-equivalent (zeroed) when goroutine is running.
   ThreadLocalTop* saved_tlt = nullptr;
+
+  // Pointer to the LIVE per-M IsolateData's TLT (not a copy).
+  // Set in Park, used in Unpark to write GC-updated fields back.
+  // After GC moves objects, saved_tlt has updated pointers; we must copy them
+  // back to live_tlt so the running goroutine sees the correct addresses.
+  ThreadLocalTop* live_tlt = nullptr;
+
+  // Per-M HandleScopeImplementer snapshot for GC.
+  // Each goroutine M-thread has its own HSI (not visible to GC via the main
+  // isolate->handle_scope_implementer() path which returns the MAIN HSI).
+  // Handles created inside V8 runtime functions (e.g. Runtime_StoreIC_Miss)
+  // live in the per-M HSI and MUST be visited by GC or they go stale after
+  // object evacuation → stale Handle → crash (GetRootForNonJSReceiver).
+  // Set to the active M's HSI in Park(), cleared to nullptr in Unpark().
+  HandleScopeImplementer* hsi = nullptr;
+
+  // Snapshot of the per-M HandleScopeData taken at Park() time.
+  // hsi->Iterate(visitor) internally calls isolate_->handle_scope_data() which,
+  // from the main GC thread, returns the MAIN thread's HSD — wrong limit for
+  // the per-M HSI's current block. We save the per-M HSD here so IterateRoots()
+  // can temporarily swap it into the isolate before calling hsi->Iterate(),
+  // ensuring the correct block limit is used when scanning per-M handles.
+  HandleScopeData saved_hsd = {};
 
   // True when this goroutine is yielded and registered for GC scanning.
   bool yielded = false;

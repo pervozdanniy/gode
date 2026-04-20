@@ -25,6 +25,13 @@ class Isolate;
 class IsolateData;
 class HandleScopeImplementer;
 
+// Per-M IsolateData pointer — fast TLS for hot-path dispatch in isolate.h.
+// Set by GoroutineThreadState::ActivatePState(), cleared by DeactivatePState().
+// nullptr on all non-goroutine threads (main thread, worker threads, etc.).
+// Using initial-exec TLS model for single-instruction access on x86_64.
+extern thread_local __attribute__((tls_model("initial-exec")))
+    IsolateData* tls_per_m_isolate_data;
+
 // Per-M V8 state. Owned by M thread.
 struct GoroutinePState {
   IsolateData* isolate_data;

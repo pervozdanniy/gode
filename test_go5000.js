@@ -1,33 +1,53 @@
-const { go } = require('goroutine');
-const N = 5000;
+const {go} = require('goroutine');
+const N = 100;
+
 
 // SharedArrayBuffer + Atomics — единственный безопасный способ
 // разделять счётчик между горутин-тредами и main thread.
 const sab = new SharedArrayBuffer(4);
 const counter = new Int32Array(sab);
 
-console.log(Atomics.isLockFree(counter.BYTES_PER_ELEMENT), 'Counter is lock-free');
+console.log('Lock free: ', Atomics.isLockFree(counter.BYTES_PER_ELEMENT));
 
 const start = performance.now();
-const fn = () => {
-  const obj = { opa: 'jopa' }
-  const arr = new Array(40000);
-  for (let j = 0; j < 100000; j++) {}
-  Atomics.add(counter, 0, 1);
-};
+
+class User {
+    name = 'default';
+    age = 'default';
+    sex = 'default';
+
+    constructor(data) {
+        Object.assign(this, data);
+    }
+}
+
+function worker() {
+    const obj = {}
+    const arr = [];
+    const instance = new User();
+    let sum = 0;
+    for (let j = 0; j < 1_000_000; j++) {
+        sum += j * 10;
+        const len = arr.push(sum);
+        // obj['prop'] = sum
+        // obj.curr = arr[len - 1];
+    }
+    Atomics.add(counter, 0, 1);
+}
 
 for (let i = 0; i < N; i++) {
-  go(fn);
+    go(worker);
 }
 
 function waitAll() {
-  const done = Atomics.load(counter, 0);
-  if (done < N) {
-    console.log('Curr', done);
-    setTimeout(waitAll, 500);
-  } else {
-    const took = performance.now() - start;
-    console.log(`All ${done} goroutines done OK in ${took.toFixed(0)} ms`);
-  }
+    const done = Atomics.load(counter, 0);
+    if (done < N) {
+        console.log('Curr', done);
+        setTimeout(waitAll, 500);
+    } else {
+        const took = performance.now() - start;
+        console.log(`All ${done} goroutines done OK in ${took.toFixed(0)} ms`);
+    }
 }
-setTimeout(waitAll, 50);
+
+setTimeout(waitAll, 500);

@@ -5,6 +5,10 @@
 #include <cstdio>
 #include <mutex>
 #include <string>
+#include <time.h>
+
+// Uncomment to enable per-goroutine execution tracing:
+#define GOROUTINE_TRACE 1
 
 // Global V8 Lock — serialises concurrent goroutine execution until
 // per-thread JIT cache (Phase 2) makes true parallelism safe.
@@ -107,7 +111,29 @@ void M::ThreadLoop() {
       // Unpark: signals V8 heap access begins; GC must wait for safepoint.
       v8_goroutine_local_heap_unpark(local_heap_);
 
+#if defined(GOROUTINE_TRACE)
+      struct timespec ts_wall_start, ts_wall_end, ts_cpu_start, ts_cpu_end;
+      clock_gettime(CLOCK_MONOTONIC, &ts_wall_start);
+      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu_start);
+      pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+#endif
+
       RunG(g, isolate);
+
+#if defined(GOROUTINE_TRACE)
+      clock_gettime(CLOCK_MONOTONIC, &ts_wall_end);
+      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu_end);
+      double wall_ms = (ts_wall_end.tv_sec - ts_wall_start.tv_sec) * 1000.0 +
+                       (ts_wall_end.tv_nsec - ts_wall_start.tv_nsec) / 1e6;
+      double cpu_ms  = (ts_cpu_end.tv_sec  - ts_cpu_start.tv_sec)  * 1000.0 +
+                       (ts_cpu_end.tv_nsec  - ts_cpu_start.tv_nsec)  / 1e6;
+      double abs_ms  = ts_wall_start.tv_sec * 1000.0 + ts_wall_start.tv_nsec / 1e6;
+      double cpu_util = (wall_ms > 0) ? (cpu_ms / wall_ms * 100.0) : 0.0;
+      fprintf(stderr, "[M%u tid=%d] g=%p start=%.1f wall=%.1fms cpu=%.1fms util=%.0f%%\n",
+              id_, (int)tid, static_cast<void*>(g), abs_ms,
+              wall_ms, cpu_ms, cpu_util);
+#endif
+
       v8_goroutine_local_heap_park(local_heap_);
 
       current_g_ = nullptr;
@@ -117,11 +143,13 @@ void M::ThreadLoop() {
         std::lock_guard<std::mutex> lock(rt->dead_mutex_);
         rt->dead_queue_.push_back(g);
       }
-    }
 
-    if (rt->async_init_) {
+      // Send uv_async after each goroutine so the main thread can drain the
+      // dead-G queue and check the Go-style GC trigger mid-batch.
+      // uv_async_send is coalescent: N sends → at most 1 OnAsync per event-loop
+      // iteration, so there is no amplification. Cost is one eventfd write (~ns).
       uv_async_send(&rt->async_handle_);
-    }
+    }  // end inner while
   }
 
   // ThreadLoop exiting. Destroy LocalHeap from THIS (worker) thread — required
@@ -249,6 +277,27 @@ void Runtime::OnAsync(uv_async_t* handle) {
     dead.swap(rt->dead_queue_);
   }
   for (G* g : dead) delete g;
+
+  // Go-style adaptive GC: trigger when heap has grown by kGCGrowthFactor
+  // since the last GC, then update the trigger for the next cycle.
+  // This mirrors Go's nextGC = live_after_gc * (1 + GOGC/100):
+  //   - heavy allocators → trigger fires sooner (heap grows fast)
+  //   - light workloads  → trigger fires rarely (heap stays small)
+  if (!dead.empty()) {
+    v8::HeapStatistics hs;
+    rt->isolate_->GetHeapStatistics(&hs);
+    size_t used = hs.used_heap_size();
+    size_t trigger = rt->gc_trigger_heap_.load(std::memory_order_relaxed);
+    if (trigger == 0 || used >= trigger) {
+      rt->isolate_->LowMemoryNotification();
+      // Recalculate trigger after GC based on new live heap size.
+      rt->isolate_->GetHeapStatistics(&hs);
+      size_t live = hs.used_heap_size();
+      rt->gc_trigger_heap_.store(
+          static_cast<size_t>(live * kGCGrowthFactor),
+          std::memory_order_relaxed);
+    }
+  }
 
   // Drain the goroutine print queue on the main thread.
   std::vector<std::string> local;

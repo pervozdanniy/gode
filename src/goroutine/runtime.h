@@ -120,6 +120,16 @@ class Runtime {
   std::mutex dead_mutex_;
   std::vector<G*> dead_queue_;
 
+  // Go-style adaptive GC trigger (analogous to Go's nextGC).
+  // After each GC cycle the main thread sets:
+  //   gc_trigger_heap_ = used_heap_after_gc * kGCGrowthFactor
+  // The next GC fires when used_heap >= gc_trigger_heap_.
+  // This makes GC frequency proportional to actual heap growth, not goroutine
+  // count: heavy allocators trigger GC sooner; light workloads trigger it rarely.
+  // 0 = not yet initialized; OnAsync treats 0 as "always check".
+  static constexpr double kGCGrowthFactor = 2.0;  // analogous to GOGC=100
+  std::atomic<size_t> gc_trigger_heap_{0};
+
   // Worker M-threads (M1, M2, …).
   std::vector<M*> workers_;
 

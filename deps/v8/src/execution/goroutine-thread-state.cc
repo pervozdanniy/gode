@@ -29,6 +29,17 @@ namespace internal {
 // Thread-local: pointer to the ACTIVE M's V8 state on this thread.
 static thread_local GoroutinePState* g_active_p_state = nullptr;
 
+// Fast TLS pointer for hot-path dispatch in isolate.h (thread_local_top,
+// handle_scope_data). Defined here, declared in goroutine-thread-state.h.
+thread_local __attribute__((tls_model("initial-exec")))
+    IsolateData* tls_per_m_isolate_data = nullptr;
+
+// Pointer to the REAL main-thread IsolateData (the original, not any per-M copy).
+// Set once in CreatePState() when v8_goroutine_thread is still false, so
+// isolate->isolate_data() returns the genuine main IsolateData.
+// Used in LabSyncBeforeRun() to refresh per-M roots_table_ after GC.
+static IsolateData* g_main_isolate_data = nullptr;
+
 // ---- Accessors (called from patched V8 code) ----
 
 IsolateData* GoroutineThreadState::GetIsolateData() {
@@ -48,6 +59,13 @@ bool GoroutineThreadState::IsActive() {
 GoroutinePState* GoroutineThreadState::CreatePState(Isolate* isolate) {
   // Called on main thread. isolate->isolate_data() returns the real main data.
   IsolateData* main_data = isolate->isolate_data();
+
+  // Capture the real main IsolateData pointer ONCE (before any M-thread activates
+  // its per-M IsolateData via the isolate_data() patch).  Used by LabSyncBeforeRun
+  // to refresh per-M roots_table_ after GC without going through the patch.
+  if (!g_main_isolate_data) {
+    g_main_isolate_data = main_data;
+  }
   Tagged<Context> main_ctx = main_data->thread_local_top().context_;
 
   // Allocate per-M IsolateData (aligned).
@@ -73,6 +91,12 @@ GoroutinePState* GoroutineThreadState::CreatePState(Isolate* isolate) {
   p_data->new_allocation_info_.Reset(kNullAddress, kNullAddress);
   p_data->old_allocation_info_.Reset(kNullAddress, kNullAddress);
 
+  // Per-M interrupt budget: initialise to a large positive value so the
+  // budget never reaches zero and BytecodeBudgetInterrupt is never triggered
+  // from goroutine M-threads. Since this field lives in the per-M IsolateData
+  // (accessed via [r13 + offset]), each M-thread has its own private copy —
+  // no cache-line sharing between M-threads even for hot JumpLoop bytecodes.
+
   // HandleScopeImplementer: per-M instance.
   HandleScopeImplementer* hsi = new HandleScopeImplementer(isolate);
 
@@ -94,6 +118,7 @@ void GoroutineThreadState::DestroyPState(GoroutinePState* state) {
 void GoroutineThreadState::ActivatePState(GoroutinePState* state) {
   g_active_p_state = state;
   v8_goroutine_thread = true;
+  tls_per_m_isolate_data = state->isolate_data;
 
   // Update StackGuard for THIS M-thread's stack.
   uintptr_t stack_here = reinterpret_cast<uintptr_t>(&stack_here);
@@ -110,6 +135,7 @@ void GoroutineThreadState::ActivatePState(GoroutinePState* state) {
 void GoroutineThreadState::DeactivatePState() {
   g_active_p_state = nullptr;
   v8_goroutine_thread = false;
+  tls_per_m_isolate_data = nullptr;
 }
 
 
@@ -135,17 +161,34 @@ void GoroutineThreadState::LabSyncBeforeRun() {
   LocalHeap* lh = LocalHeap::Current();
   if (!lh) return;
 
-  // Sync write-barrier marking flags from the main IsolateData to per-M
-  // IsolateData. These flags are set AFTER goroutine threads are created
-  // (concurrent marking starts at arbitrary times). If stale (= 0 when main
-  // has 1), goroutine write-barriers silently skip recording, objects are not
-  // traced by GC, and get freed → heap corruption → IsFunction() returns false.
-  Isolate* isolate = lh->heap()->isolate();
-  IsolateData* main_data = isolate->isolate_data();
-  g_active_p_state->isolate_data->is_marking_flag_ =
-      main_data->is_marking_flag_;
-  g_active_p_state->isolate_data->is_minor_marking_flag_ =
-      main_data->is_minor_marking_flag_;
+  // Refresh per-M IsolateData from the real main IsolateData.
+  // This is critical after MarkCompact GC: GC updates main IsolateData's
+  // roots_table_ in-place (objects moved to new addresses), but per-M
+  // IsolateData is a malloc'd copy that GC does not visit. Without this sync,
+  // goroutines read stale root pointers from their per-M IsolateData (via r13),
+  // leading to "Check failed: instance_type() >= FIRST_JS_RECEIVER_TYPE" and
+  // similar crashes when they access moved objects through stale root slots.
+  //
+  // Called while LocalHeap is still Running (we just Unparked), so GC cannot
+  // start — no concurrent modification of g_main_isolate_data->roots().
+  if (g_main_isolate_data) {
+    // Copy the full roots table (~4 KB, ~500 pointers). Fast memcpy.
+    std::memcpy(&g_active_p_state->isolate_data->roots(),
+                &g_main_isolate_data->roots(),
+                sizeof(RootsTable));
+
+    // Sync write-barrier marking flags. These flags are set when concurrent
+    // marking starts (at arbitrary times after M-thread creation). The per-M
+    // copy was initialised from main at CreatePState time; if marking started
+    // later, the per-M flag stays 0 and goroutine write-barriers silently skip
+    // recording → objects not traced → freed prematurely → heap corruption.
+    // Previously this sync was a no-op because isolate->isolate_data() returned
+    // per-M data through the patch. g_main_isolate_data bypasses the patch.
+    g_active_p_state->isolate_data->is_marking_flag_ =
+        g_main_isolate_data->is_marking_flag_;
+    g_active_p_state->isolate_data->is_minor_marking_flag_ =
+        g_main_isolate_data->is_minor_marking_flag_;
+  }
 
   // Steal LocalHeap's Old Space LAB into per-M IsolateData so JIT
   // bump-pointer fast path (r13-based) works without hitting slow path.
@@ -183,6 +226,13 @@ static void GoSetStackLimit(uintptr_t limit) {
   if (!g_active_p_state) return;
   StackGuard* sg = g_active_p_state->isolate_data->stack_guard();
   sg->SetStackLimit(limit);
+}
+
+// Returns the current M-thread's HandleScopeImplementer (per-M HSI).
+// Called from goroutine-gc-roots.cc during safepoint park to register HSI
+// for GC root scanning. nullptr if no goroutine M-thread is active.
+static HandleScopeImplementer* GetCurrentHSI() {
+  return g_active_p_state ? g_active_p_state->handle_scope_impl : nullptr;
 }
 
 }  // namespace internal
@@ -313,6 +363,13 @@ void* v8_goroutine_get_isolate_data() {
 // from goroutine M-threads.
 void v8_goroutine_set_stack_limit(uintptr_t limit) {
   v8::internal::GoSetStackLimit(limit);
+}
+
+// Returns the current M-thread's HandleScopeImplementer (per-M HSI).
+// Used by GoroutineGCRegistry::Park to capture the HSI for GC root visiting.
+// Must be called from the M-thread that is about to park (safepoint_park).
+void* v8_goroutine_get_current_hsi() {
+  return static_cast<void*>(v8::internal::GetCurrentHSI());
 }
 
 }  // extern "C"

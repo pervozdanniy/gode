@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <climits>
 #include <memory>
 
 #include "src/api/api-inl.h"
@@ -375,6 +376,18 @@ namespace {
 Tagged<Object> BytecodeBudgetInterruptWithStackCheck(Isolate* isolate,
                                                      RuntimeArguments& args,
                                                      CodeKind code_kind) {
+  // GOROUTINE PATCH: Must check BEFORE HandleScope — on M-threads `isolate`
+  // is computed as (r13 - kRootRegisterBias) where r13 = per-M IsolateData,
+  // so `isolate` is a garbage pointer. Use Isolate::Current() instead.
+  // Reset FeedbackCell budget to INT32_MAX/2 so it doesn't fire on every
+  // subsequent JumpLoop. No tiering on M-threads (would deadlock).
+  if (v8_goroutine_thread) {
+    Isolate* real = Isolate::Current();
+    DirectHandle<JSFunction> fn = args.at<JSFunction>(0);
+    fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
+    return ReadOnlyRoots(real).undefined_value();
+  }
+
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
   DirectHandle<JSFunction> function = args.at<JSFunction>(0);
@@ -384,9 +397,6 @@ Tagged<Object> BytecodeBudgetInterruptWithStackCheck(Isolate* isolate,
   // into bytecode budget interrupts.
   StackLimitCheck check(isolate);
   if (check.JsHasOverflowed()) {
-    // We ideally wouldn't actually get StackOverflows here, since we stack
-    // check on bytecode entry, but it's possible that this check fires due to
-    // the runtime function call being what overflows the stack.
     return isolate->StackOverflow();
   } else if (check.InterruptRequested()) {
     Tagged<Object> return_value = isolate->stack_guard()->HandleInterrupts();
@@ -401,12 +411,23 @@ Tagged<Object> BytecodeBudgetInterruptWithStackCheck(Isolate* isolate,
 
 Tagged<Object> BytecodeBudgetInterrupt(Isolate* isolate, RuntimeArguments& args,
                                        CodeKind code_kind) {
+  // GOROUTINE PATCH: Must check BEFORE HandleScope — isolate from r13 is
+  // garbage on M-threads. Reset FeedbackCell to INT32_MAX/2 so the budget
+  // interrupt doesn't re-fire on every subsequent JumpLoop.
+  if (v8_goroutine_thread) {
+    Isolate* real = Isolate::Current();
+    DirectHandle<JSFunction> fn = args.at<JSFunction>(0);
+    fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
+    return ReadOnlyRoots(real).undefined_value();
+  }
+
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
   DirectHandle<JSFunction> function = args.at<JSFunction>(0);
   function->TraceOptimizationStatus("budget from %s",
                                     CodeKindToString(code_kind));
   TRACE_EVENT0("v8.execute", "V8.BytecodeBudgetInterrupt");
+
 
   isolate->tiering_manager()->OnInterruptTick(function, code_kind);
   return ReadOnlyRoots(isolate).undefined_value();
