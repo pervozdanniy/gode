@@ -143,6 +143,9 @@ void HeapAllocator::CollectGarbage(AllocationType allocation) {
   }
 }
 
+extern "C" void v8_goroutine_alloc_lock();
+extern "C" void v8_goroutine_alloc_unlock();
+
 AllocationResult HeapAllocator::AllocateRawWithRetryOrFailSlowPath(
     int size, AllocationType allocation, AllocationOrigin origin,
     AllocationAlignment alignment) {

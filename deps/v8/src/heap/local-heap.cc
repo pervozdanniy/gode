@@ -36,6 +36,10 @@ extern "C" void v8_goroutine_safepoint_unpark();
 // Sync per-M IsolateData roots_table_ from main after GC evacuation.
 // Must be called after every safepoint unpark, not just at goroutine start.
 extern "C" void v8_goroutine_lab_sync_before_run();
+// Flush per-M IsolateData LAB top back to LocalHeap before parking.
+// Must be called before every safepoint park so FreeLinearAllocationAreas()
+// sees the correct top and does not overwrite already-allocated objects.
+extern "C" void v8_goroutine_lab_sync_after_run();
 
 namespace v8 {
 namespace internal {
@@ -274,9 +278,11 @@ void LocalHeap::ParkSlowPath() {
       DCHECK(current_state.IsSafepointRequested());
       DCHECK(!current_state.IsCollectionRequested());
 
-      // GOROUTINE PATCH: If this M-thread is running a goroutine, register its
-      // mmap stack frames as GC roots before GC is allowed to run.
+      // GOROUTINE PATCH: If this M-thread is running a goroutine, flush the
+      // per-M LAB top to LocalHeap first (so FreeLinearAllocationAreas doesn't
+      // overwrite live goroutine objects), then register goroutine mmap stack.
       if (v8_goroutine_thread) {
+        v8_goroutine_lab_sync_after_run();
         v8_goroutine_safepoint_park(heap_->isolate());
       }
 
@@ -402,6 +408,12 @@ void LocalHeap::SleepInSafepoint() {
   // register goroutine frames via GoroutineGCRegistry instead of the
   // conservative stack marker mechanism, then park/wait/unpark directly.
   if (v8_goroutine_thread) {
+    // Flush per-M LAB top → LocalHeap BEFORE parking.
+    // Without this, FreeLinearAllocationAreas() (called by main GC under safepoint)
+    // fills [LocalHeap.top, limit] as free space — but the per-M inline path may
+    // have already bumped the top beyond LocalHeap's view, so GC would overwrite
+    // already-allocated live objects → heap corruption → crash in ProcessMarkingWorklist.
+    v8_goroutine_lab_sync_after_run();
     v8_goroutine_safepoint_park(heap_->isolate());
 
     ThreadState old_state = state_.SetParked();

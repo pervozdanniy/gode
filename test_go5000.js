@@ -1,5 +1,5 @@
 const {go} = require('goroutine');
-const N = 100;
+const N = 1000;
 
 
 // SharedArrayBuffer + Atomics — единственный безопасный способ
@@ -22,9 +22,9 @@ class User {
 }
 
 function worker() {
-    const obj = {}
+    // const obj = {}
     const arr = [];
-    const instance = new User();
+    // const instance = new User();
     let sum = 0;
     for (let j = 0; j < 1_000_000; j++) {
         sum += j * 10;

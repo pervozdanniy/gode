@@ -14,7 +14,11 @@ namespace goroutine {
 
 // Stack configuration (matching Go's defaults)
 constexpr size_t kStackGuardSize = 4096;      // 4KB guard page
+#ifdef __SANITIZE_ADDRESS__
+constexpr size_t kStackSize = 262144;        // 256KB with ASAN (red zones bloat frames)
+#else
 constexpr size_t kStackSize = 65536;          // 64KB usable stack
+#endif
 constexpr size_t kTotalStackSize = kStackGuardSize + kStackSize;
 
 // Represents a goroutine stack

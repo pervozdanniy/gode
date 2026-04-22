@@ -69,8 +69,16 @@ GoroutinePState* GoroutineThreadState::CreatePState(Isolate* isolate) {
   Tagged<Context> main_ctx = main_data->thread_local_top().context_;
 
   // Allocate per-M IsolateData (aligned).
+  // Add 8KB padding: V8 signal handlers (TrapWebAssemblyOrContinue) and some
+  // builtins access fields at offsets beyond sizeof(IsolateData) assuming it's
+  // embedded in the full Isolate struct. The padding prevents ASAN OOB reports.
   constexpr size_t kAlign = alignof(IsolateData);
-  constexpr size_t kSize = (sizeof(IsolateData) + kAlign - 1) & ~(kAlign - 1);
+#ifdef __SANITIZE_ADDRESS__
+  constexpr size_t kPadding = 8192;  // V8 signal handlers read past IsolateData
+#else
+  constexpr size_t kPadding = 0;
+#endif
+  constexpr size_t kSize = (sizeof(IsolateData) + kPadding + kAlign - 1) & ~(kAlign - 1);
   void* raw = std::aligned_alloc(kAlign, kSize);
   if (!raw) {
     std::abort();
@@ -142,18 +150,19 @@ void GoroutineThreadState::DeactivatePState() {
 // ---- Per-G HandleScopeData helpers ----
 
 void GoroutineThreadState::SaveHSD(Isolate* isolate, void* buf) {
-  std::memcpy(buf, &isolate->isolate_data()->handle_scope_data_,
-              sizeof(HandleScopeData));
+  // Use handle_scope_data() which returns per-M data on M-threads
+  // (via tls_per_m_isolate_data), not isolate_data()->handle_scope_data_
+  // which always returns MAIN data and would race with the main thread.
+  std::memcpy(buf, isolate->handle_scope_data(), sizeof(HandleScopeData));
 }
 
 void GoroutineThreadState::RestoreHSD(Isolate* isolate, const void* buf) {
-  std::memcpy(&isolate->isolate_data()->handle_scope_data_, buf,
-              sizeof(HandleScopeData));
+  std::memcpy(isolate->handle_scope_data(), buf, sizeof(HandleScopeData));
 }
 
 void GoroutineThreadState::ForceNewHandleBlock(Isolate* isolate) {
-  auto& hsd = isolate->isolate_data()->handle_scope_data_;
-  hsd.next = hsd.limit;
+  HandleScopeData* hsd = isolate->handle_scope_data();
+  hsd->next = hsd->limit;
 }
 
 void GoroutineThreadState::LabSyncBeforeRun() {
@@ -374,3 +383,24 @@ void* v8_goroutine_get_current_hsi() {
 
 }  // extern "C"
 
+// ---- Goroutine heap allocation mutex ----
+// Serialises LocalHeap::AllocateRawWith calls between M-threads.
+// V8's OldSpace internals (page allocation, MemoryChunk metadata, concurrent
+// marking state) are not designed for >1 background thread allocating heavily
+// at the same time. This mutex ensures only one M-thread is inside V8's
+// allocation slow-path at a time. Main thread is NOT affected (it never
+// enters the v8_goroutine_thread path).
+#include <mutex>
+static std::mutex g_goroutine_alloc_mutex;
+
+extern "C" {
+
+void v8_goroutine_alloc_lock() {
+  g_goroutine_alloc_mutex.lock();
+}
+
+void v8_goroutine_alloc_unlock() {
+  g_goroutine_alloc_mutex.unlock();
+}
+
+}  // extern "C"

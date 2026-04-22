@@ -7,6 +7,7 @@
 #include "src/api/api-inl.h"
 #include "src/debug/debug.h"
 #include "src/execution/frames.h"
+#include "src/execution/goroutine-flag.h"
 #include "src/execution/isolate-inl.h"
 #include "src/execution/vm-state-inl.h"
 #include "src/logging/runtime-call-stats-scope.h"
@@ -443,8 +444,13 @@ V8_WARN_UNUSED_RESULT MaybeHandle<Object> Invoke(Isolate* isolate,
       SealHandleScope shs(isolate);
 
       RCS_SCOPE(isolate, RuntimeCallCounterId::kJS_Execution);
+      // GOROUTINE PATCH: on goroutine M-threads use per-M IsolateData root so
+      // JSEntry sets r13 = per-M, keeping c_entry_fp / thread_local_top consistent.
+      IsolateData* active_data = (v8_goroutine_thread && tls_per_m_isolate_data)
+                                     ? tls_per_m_isolate_data
+                                     : isolate->isolate_data();
       value = Tagged<Object>(
-          stub_entry.Call(isolate->isolate_data()->isolate_root(), orig_func,
+          stub_entry.Call(active_data->isolate_root(), orig_func,
                           func, recv, JSParameterCount(argc), argv));
     } else {
       DCHECK_EQ(Execution::Target::kRunMicrotasks, params.execution_target);
@@ -462,8 +468,11 @@ V8_WARN_UNUSED_RESULT MaybeHandle<Object> Invoke(Isolate* isolate,
       SealHandleScope shs(isolate);
 
       RCS_SCOPE(isolate, RuntimeCallCounterId::kJS_Execution);
+      IsolateData* active_data2 = (v8_goroutine_thread && tls_per_m_isolate_data)
+                                      ? tls_per_m_isolate_data
+                                      : isolate->isolate_data();
       value = Tagged<Object>(stub_entry.Call(
-          isolate->isolate_data()->isolate_root(), params.microtask_queue));
+          active_data2->isolate_root(), params.microtask_queue));
     }
   }
 

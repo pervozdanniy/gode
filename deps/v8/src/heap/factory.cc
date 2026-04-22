@@ -102,6 +102,8 @@
 // delegating to goroutine's LocalHeap, re-steal after.
 extern "C" void v8_goroutine_lab_sync_after_run();
 extern "C" void v8_goroutine_lab_sync_before_run();
+extern "C" void v8_goroutine_alloc_lock();
+extern "C" void v8_goroutine_alloc_unlock();
 
 namespace v8 {
 namespace internal {

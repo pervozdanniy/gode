@@ -4,7 +4,13 @@
 
 #include "src/handles/handles.h"
 
+#include <cstdio>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include "src/api/api.h"
+#include "src/execution/goroutine-flag.h"
+#include "src/execution/goroutine-thread-state.h"
 #include "src/base/logging.h"
 #include "src/codegen/optimized-compilation-info.h"
 #include "src/execution/isolate.h"
@@ -194,6 +200,18 @@ Address* HandleScope::Extend(Isolate* isolate) {
   DCHECK(result == current->limit);
   // Make sure there's at least one scope on the stack and that the
   // top of the scope stack isn't a barrier.
+  if (current->level == current->sealed_level) {
+    fprintf(stderr,
+            "\n[GOROUTINE-DEBUG] HandleScope::Extend FAIL on tid=%d\n"
+            "  level=%d sealed_level=%d next=%p limit=%p\n"
+            "  v8_goroutine_thread=%d tls_per_m_isolate_data=%p\n"
+            "  isolate=%p handle_scope_data=%p\n",
+            (int)syscall(SYS_gettid),
+            current->level, current->sealed_level,
+            (void*)current->next, (void*)current->limit,
+            (int)v8_goroutine_thread, (void*)tls_per_m_isolate_data,
+            (void*)isolate, (void*)current);
+  }
   if (!Utils::ApiCheck(current->level != current->sealed_level,
                        "v8::HandleScope::CreateHandle()",
                        "Cannot create a handle without a HandleScope")) {

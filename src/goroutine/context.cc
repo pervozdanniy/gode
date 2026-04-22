@@ -5,6 +5,16 @@
 #include <cstdint>
 #include <cstdio>
 
+// ---- ASAN fiber support ----
+// When built with -fsanitize=address, we must tell ASAN about our custom
+// mmap stacks so it doesn't report false positives or segfault on mprotect.
+#ifdef __SANITIZE_ADDRESS__
+#include <sanitizer/common_interface_defs.h>
+#define GOROUTINE_ASAN 1
+#else
+#define GOROUTINE_ASAN 0
+#endif
+
 
 // ---- Boost.Context fcontext C API (transfer_t version) ----
 // The actual ABI: jump_fcontext returns {fctx, data} in RAX+RDX,
@@ -49,6 +59,10 @@ namespace goroutine {
 static thread_local fcontext_t tls_sched_ctx = nullptr;
 // Currently executing goroutine on this M-thread.
 static thread_local G* tls_current_g = nullptr;
+#if GOROUTINE_ASAN
+// ASAN fake stack pointer saved when switching away from a fiber.
+static thread_local void* tls_asan_fake_stack = nullptr;
+#endif
 
 // ---- Goroutine entry point (runs on G's own 64 KB stack) ----
 static void goroutine_entry(fctx_transfer_t t) {
@@ -57,6 +71,11 @@ static void goroutine_entry(fctx_transfer_t t) {
   tls_sched_ctx = t.fctx;
   G* g = static_cast<G*>(t.data);
 
+#if GOROUTINE_ASAN
+  // Complete the fiber switch started by RunG's start_switch_fiber.
+  __sanitizer_finish_switch_fiber(tls_asan_fake_stack, nullptr, nullptr);
+#endif
+
   // Set kRootRegister (r13) to per-M IsolateData so V8 fast paths work.
   // New fcontext stacks have r13=0; we must set it before any V8 generated code.
   void* iso_data = v8_goroutine_get_isolate_data();
@@ -64,6 +83,12 @@ static void goroutine_entry(fctx_transfer_t t) {
   v8::Isolate* iso = v8::Isolate::GetCurrent();
   g->Execute(iso);
   g->SetState(GState::Gdead);
+
+#if GOROUTINE_ASAN
+  // Switching back to scheduler (g0) — tell ASAN we're leaving this fiber.
+  // Pass nullptr for bottom/size since we're switching to a pthread stack.
+  __sanitizer_start_switch_fiber(&tls_asan_fake_stack, nullptr, 0);
+#endif
 
   // Return to scheduler.  Never returns.
   jump_fcontext(tls_sched_ctx, static_cast<void*>(g));
@@ -91,20 +116,32 @@ void RunG(G* g, v8::Isolate* isolate) {
   }
 
   // Set stack limit for the goroutine's small mmap stack via per-M StackGuard.
-  // Use v8_goroutine_set_stack_limit (not isolate->SetStackLimit) to avoid
-  // corrupting the shared Isolate::stack_size_ field.
   uintptr_t g_stack_bottom = reinterpret_cast<uintptr_t>(g->stack()->top());
   v8_goroutine_set_stack_limit(g_stack_bottom + 8192);
 
   tls_current_g = g;
-  // Register goroutine's GC state so local-heap.cc safepoint hooks can find
-  // it when GC fires mid-goroutine (without explicit YieldG).
   v8_goroutine_set_current_gc_state(g->gc_state());
 
   v8_goroutine_lab_sync_before_run();
+
+#if GOROUTINE_ASAN
+  // Tell ASAN we're switching FROM the scheduler (pthread) stack
+  // TO the goroutine's mmap stack.
+  void* g_stack_bottom_ptr = g->stack()->top();   // low address
+  size_t g_stack_size = g->stack()->size();        // usable size
+  __sanitizer_start_switch_fiber(&tls_asan_fake_stack,
+                                 g_stack_bottom_ptr, g_stack_size);
+#endif
+
   fctx_transfer_t result = jump_fcontext(
       static_cast<fcontext_t>(g->stack_context()),
       static_cast<void*>(g));
+
+#if GOROUTINE_ASAN
+  // Back on scheduler (pthread) stack — complete the switch.
+  __sanitizer_finish_switch_fiber(tls_asan_fake_stack, nullptr, nullptr);
+#endif
+
   v8_goroutine_lab_sync_after_run();
 
   // Back on g0 stack — goroutine is no longer running on this M-thread.
@@ -131,32 +168,35 @@ void YieldG() {
   G* g = tls_current_g;
   if (!g) return;
 
-
   g->SetState(GState::Grunnable);
   Scheduler::GetInstance()->Schedule(g);
   Runtime::GetInstance()->NotifyGoroutineAvailable();
 
-  // Park: snapshot goroutine's TLT onto gc_state so GC can scan its mmap
-  // stack while it's yielded. Must happen BEFORE jump to scheduler.
   v8_goroutine_gc_park(v8::Isolate::GetCurrent(), g->gc_state());
-  // Flush LAB back to LocalHeap before yielding (goroutine stops touching heap).
   v8_goroutine_lab_sync_after_run();
+
+#if GOROUTINE_ASAN
+  // Switching FROM goroutine mmap stack TO scheduler pthread stack.
+  __sanitizer_start_switch_fiber(&tls_asan_fake_stack, nullptr, 0);
+#endif
+
   // Jump back to scheduler (g0).
   fctx_transfer_t t = jump_fcontext(tls_sched_ctx, static_cast<void*>(g));
+
+#if GOROUTINE_ASAN
+  // Resumed on goroutine mmap stack — complete the switch.
+  __sanitizer_finish_switch_fiber(tls_asan_fake_stack, nullptr, nullptr);
+#endif
+
   // Goroutine resumes here (RunG called jump_fcontext back to us).
   // Restore kRootRegister (r13) — may have been clobbered by scheduler context.
   {
     void* iso_data = v8_goroutine_get_isolate_data();
     __asm__ volatile("movq %0, %%r13" : : "r"(iso_data) : "r13");
   }
-  // Phase 1.3: SeqLock — before touching V8 heap, ensure no shape transition
-  // is in progress on the main thread. Spins with cpu_relax (fast path ~1ns).
   v8_goroutine_shape_seqlock_wait();
-  // Steal LocalHeap LAB again now that we're running.
   v8_goroutine_lab_sync_before_run();
-  // Unpark: remove from GC scanning registry — we're running again.
   v8_goroutine_gc_unpark(g->gc_state());
-  // Update g0 context for next yield.
   tls_sched_ctx = t.fctx;
 }
 

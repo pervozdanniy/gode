@@ -22,6 +22,9 @@
 #include "src/execution/goroutine-flag.h"
 #include "src/heap/local-heap.h"
 #include "src/heap/local-heap-inl.h"
+
+extern "C" void v8_goroutine_alloc_lock();
+extern "C" void v8_goroutine_alloc_unlock();
 #include "src/objects/free-space-inl.h"
 
 namespace v8 {
@@ -204,7 +207,6 @@ RUNTIME_FUNCTION(Runtime_ThrowInvalidTypedArrayAlignment) {
 RUNTIME_FUNCTION(Runtime_UnwindAndFindExceptionHandler) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(0, args.length());
-  return isolate->UnwindAndFindHandler();
 }
 
 RUNTIME_FUNCTION(Runtime_PropagateException) {

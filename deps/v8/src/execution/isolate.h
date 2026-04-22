@@ -1203,7 +1203,12 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     DCHECK_NOT_NULL(v8_file_logger_);
     return v8_file_logger_;
   }
-  StackGuard* stack_guard() { return isolate_data()->stack_guard(); }
+  StackGuard* stack_guard() {
+    // GOROUTINE PATCH: per-M StackGuard for M-threads so StackLimitCheck uses
+    // the goroutine fiber stack limit, not the main thread's limit.
+    if (IsolateData* p = tls_per_m_isolate_data) return p->stack_guard();
+    return isolate_data()->stack_guard();
+  }
   Heap* heap() { return &heap_; }
   const Heap* heap() const { return &heap_; }
   ReadOnlyHeap* read_only_heap() const { return read_only_heap_; }

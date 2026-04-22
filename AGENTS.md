@@ -26,7 +26,8 @@ cd /home/pervozdanniy/code/gode && ...
 
 - **Project**: GODE — Node.js fork with real coroutines (goroutines)
 - **Location**: `/home/pervozdanniy/code/gode` (WSL Ubuntu)
-- **Build**: `ninja -C out/Release node -j8`
+- **Build (Release)**: `ninja -C out/Release node -j8`
+- **Build (ASAN)**: `ninja -C out/Asan node -j8`
 - **Test binary**: `./node` (symlink to `out/Release/node`)
 
 ## Key Source Files
@@ -35,11 +36,17 @@ cd /home/pervozdanniy/code/gode && ...
 |------|-------------|
 | `src/goroutine/runtime.cc` | M threads, Runtime, Shutdown (two-phase: SignalStop all → JoinThread all) |
 | `src/goroutine/runtime.h` | M + Runtime declarations |
-| `src/goroutine/context.cc` | RunG / YieldG, fcontext switching |
+| `src/goroutine/context.cc` | RunG / YieldG, fcontext switching, ASAN fiber annotations |
 | `src/goroutine/g.cc` | G struct, Execute(), deep pre-compile |
 | `src/goroutine/scheduler.cc` | Local + global queue, work-stealing |
-| `deps/v8/src/execution/goroutine-thread-state.cc` | Per-M IsolateData, HSD save/restore |
-| `deps/v8/src/execution/isolate.h` | Patched `isolate_data()` / `handle_scope_implementer()` |
+| `src/goroutine/stack.{h,cc}` | Stack allocation/pooling (mmap stacks; 64KB default, 256KB ASAN) |
+| `src/goroutine/channel.{h,cc}` | Channel for inter-goroutine communication |
+| `deps/v8/src/execution/goroutine-flag.h` | Thin bridge header — the ONLY goroutine include allowed in V8 files |
+| `deps/v8/src/execution/goroutine-thread-state.{h,cc}` | Per-M IsolateData, HSD save/restore, `tls_per_m_isolate_data` TLS |
+| `deps/v8/src/execution/goroutine-local-heap.{h,cc}` | Per-M LocalHeap: register worker threads with V8 GC safepoint |
+| `deps/v8/src/execution/goroutine-gc-roots.{h,cc}` | GC root scanning for yielded goroutine mmap stacks (Phase 1.2) |
+| `deps/v8/src/execution/goroutine-shape-seqlock.{h,cc}` | SeqLock protecting shape transitions during MigrateToMap (Phase 1.3) |
+| `deps/v8/src/execution/isolate.h` | Patched `thread_local_top()` / `handle_scope_data()` / `handle_scope_implementer()` via `tls_per_m_isolate_data` |
 
 ## Agent Behaviour Rules
 
@@ -58,4 +65,19 @@ cd /home/pervozdanniy/code/gode && ...
 - **GVL removed**: workers run V8 concurrently; safe only for pre-compiled pure JS (no `console.log` from goroutines — libuv I/O is not thread-safe)
 - **Shutdown two-phase**: `SignalStop()` all workers first, then `JoinThread()` all — avoids shared-semaphore deadlock where wrong M steals sem_post
 - **LocalHeap destroy**: must be called from the OWNER worker thread (uses thread-local write barriers); do NOT call from main thread
+- **`isolate_data()` always returns main**: `Isolate::isolate_data()` returns `&isolate_data_` on ALL threads (no per-M dispatch). Only these accessors dispatch via `tls_per_m_isolate_data`: `thread_local_top()`, `handle_scope_data()`, `handle_scope_implementer()`. **NEVER use `isolate->isolate_data()->handle_scope_data_` or `isolate->isolate_data()->thread_local_top_` directly** — always go through the accessor methods. `stack_guard()` is accessed via `g_active_p_state->isolate_data->stack_guard()` in goroutine code.
+- **r13 (kRootRegister)** is set to per-M IsolateData in `goroutine_entry()` and after `YieldG()` resume via inline asm. V8 builtins access IsolateData fields through r13, so this is consistent with `tls_per_m_isolate_data`.
 
+## ASAN Build
+
+Separate ASAN build lives in `out/Asan/`. To create it:
+```bash
+python3 configure.py --ninja --enable-asan
+mv out/Release out/Asan
+```
+
+Key ASAN adaptations:
+- **Fiber annotations** (`context.cc`): `__sanitizer_start/finish_switch_fiber` around every `jump_fcontext` call, guarded by `#ifdef __SANITIZE_ADDRESS__`
+- **Larger stacks** (`stack.h`): 256KB instead of 64KB — ASAN red zones bloat stack frames
+- **IsolateData padding** (`goroutine-thread-state.cc`): 8KB padding after `aligned_alloc(sizeof(IsolateData))` — V8 signal handlers (`TrapWebAssemblyOrContinue`) read past IsolateData assuming it's embedded in the full Isolate struct
+- **100K+ goroutines may OOM** under ASAN due to shadow memory overhead (256KB × N stacks)

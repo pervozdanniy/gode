@@ -13,6 +13,10 @@ extern "C" void  v8_goroutine_gc_free(void* state);
 // so worker M threads never trigger Runtime_CompileLazy concurrently.
 extern "C" void v8_goroutine_deep_compile_script(v8::Isolate* isolate,
                                                   v8::Local<v8::Function> fn);
+// Set per-M StackGuard jslimit from the current stack pointer.
+// Must be called from INSIDE the goroutine fiber so that &sp is on the fiber
+// stack — analogous to OnCheck() resetting the main-thread stack limit.
+extern "C" void v8_goroutine_set_stack_limit(uintptr_t limit);
 
 namespace node {
 namespace goroutine {
@@ -63,6 +67,12 @@ void G::SetState(GState new_state) {
 }
 
 void G::Execute(v8::Isolate* isolate) {
+  // Stack limit is already set correctly by RunG() before jumping here:
+  //   v8_goroutine_set_stack_limit(g_stack_bottom + 8192)
+  // Do NOT override it with sp - 900KB — the goroutine stack is only 64KB,
+  // so sp - 900KB would disable V8's stack overflow detection and let the
+  // goroutine silently overflow into adjacent heap memory.
+
   // No entry function → g0 (scheduler goroutine), nothing to run.
   if (entry_func_.IsEmpty()) {
     SetState(GState::Gdead);
