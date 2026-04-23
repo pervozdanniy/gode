@@ -24,6 +24,7 @@ namespace internal {
 class Isolate;
 class IsolateData;
 class HandleScopeImplementer;
+class LinearAllocationArea;
 
 // Per-M IsolateData pointer — fast TLS for hot-path dispatch in isolate.h.
 // Set by GoroutineThreadState::ActivatePState(), cleared by DeactivatePState().
@@ -69,6 +70,11 @@ class GoroutineThreadState {
   // LabSyncAfterRun:  flush updated top back to LocalHeap, reset IsolateData LAB.
   static void LabSyncBeforeRun();
   static void LabSyncAfterRun();
+
+  // Get pointer to IsolateData::old_allocation_info_ (private field).
+  // Used by goroutine-local-heap.cc to point LocalHeap's allocator
+  // at per-M IsolateData's LAB for zero-sync r13 fast path.
+  static LinearAllocationArea* GetOldAllocationInfo(IsolateData* data);
 };
 
 }  // namespace internal

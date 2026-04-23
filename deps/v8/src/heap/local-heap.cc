@@ -408,12 +408,8 @@ void LocalHeap::SleepInSafepoint() {
   // register goroutine frames via GoroutineGCRegistry instead of the
   // conservative stack marker mechanism, then park/wait/unpark directly.
   if (v8_goroutine_thread) {
-    // Flush per-M LAB top → LocalHeap BEFORE parking.
-    // Without this, FreeLinearAllocationAreas() (called by main GC under safepoint)
-    // fills [LocalHeap.top, limit] as free space — but the per-M inline path may
-    // have already bumped the top beyond LocalHeap's view, so GC would overwrite
-    // already-allocated live objects → heap corruption → crash in ProcessMarkingWorklist.
-    v8_goroutine_lab_sync_after_run();
+    // With shared LAB (ReplaceOldSpaceLAB), FreeLinearAllocationAreas() sees
+    // the correct top directly — no need to flush. Just park for GC.
     v8_goroutine_safepoint_park(heap_->isolate());
 
     ThreadState old_state = state_.SetParked();

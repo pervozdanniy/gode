@@ -2,7 +2,11 @@
 // See goroutine-local-heap.h for design overview.
 #include "src/execution/goroutine-local-heap.h"
 #include "src/execution/isolate.h"
+#include "src/execution/isolate-data.h"
+#include "src/execution/goroutine-thread-state.h"
 #include "src/heap/local-heap.h"
+#include "src/heap/heap-allocator.h"
+#include "src/heap/linear-allocation-area.h"
 namespace v8 {
 namespace internal {
 // Helper class that has friend access to LocalHeap::Park()/Unpark().
@@ -45,4 +49,13 @@ void v8_goroutine_local_heap_safepoint(void* lh) {
   // Fast path (no GC): single atomic load. No cost when GC not running.
   static_cast<v8::internal::LocalHeap*>(lh)->Safepoint();
 }
+
+void v8_goroutine_local_heap_replace_old_lab(void* lh, void* isolate_data_ptr) {
+  if (!lh || !isolate_data_ptr) return;
+  auto* local_heap = static_cast<v8::internal::LocalHeap*>(lh);
+  auto* iso_data = static_cast<v8::internal::IsolateData*>(isolate_data_ptr);
+  auto* lab = v8::internal::GoroutineThreadState::GetOldAllocationInfo(iso_data);
+  local_heap->allocator()->ReplaceOldSpaceLAB(lab);
+}
+
 }  // extern "C"

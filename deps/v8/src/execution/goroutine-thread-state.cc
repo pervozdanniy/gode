@@ -199,34 +199,14 @@ void GoroutineThreadState::LabSyncBeforeRun() {
         g_main_isolate_data->is_minor_marking_flag_;
   }
 
-  // Steal LocalHeap's Old Space LAB into per-M IsolateData so JIT
-  // bump-pointer fast path (r13-based) works without hitting slow path.
-  MainAllocator* old_alloc = lh->allocator()->old_space_allocator();
-  Address top   = *old_alloc->allocation_top_address();
-  Address limit = *old_alloc->allocation_limit_address();
-  g_active_p_state->isolate_data->old_allocation_info_.Reset(top, limit);
+  // LAB steal removed: ReplaceOldSpaceLAB (called at M-thread init) makes
+  // LocalHeap's old_space_allocator share the same LinearAllocationArea as
+  // per-M IsolateData::old_allocation_info_. No manual copy needed.
 }
 
 void GoroutineThreadState::LabSyncAfterRun() {
-  if (!g_active_p_state) return;
-  LocalHeap* lh = LocalHeap::Current();
-  if (!lh) return;
-  // Flush the JIT-updated top back to LocalHeap so it tracks consumption.
-  // IMPORTANT: only write back if per-M IsolateData top is within the LAB
-  // range AND is greater than LocalHeap's current top. If Ignition never
-  // used the LAB fast path (top == 0 because LAB was empty), writing 0
-  // would corrupt LocalHeap's allocator (top=0, limit=valid → next alloc
-  // succeeds with address 0 → SIGSEGV).
-  Address pstate_top = g_active_p_state->isolate_data->old_allocation_info_.top();
-  MainAllocator* old_alloc = lh->allocator()->old_space_allocator();
-  Address lh_top   = *old_alloc->allocation_top_address();
-  Address lh_limit = *old_alloc->allocation_limit_address();
-  if (pstate_top > lh_top && pstate_top <= lh_limit) {
-    *old_alloc->allocation_top_address() = pstate_top;
-  }
-  // Zero out IsolateData LAB so a stale limit can't be used after resume.
-  g_active_p_state->isolate_data->old_allocation_info_.Reset(
-      kNullAddress, kNullAddress);
+  // No-op: ReplaceOldSpaceLAB makes LocalHeap's allocator share the same
+  // LinearAllocationArea as per-M IsolateData. No manual flush needed.
 }
 
 // Set per-M StackGuard stack limit without touching the shared
@@ -242,6 +222,11 @@ static void GoSetStackLimit(uintptr_t limit) {
 // for GC root scanning. nullptr if no goroutine M-thread is active.
 static HandleScopeImplementer* GetCurrentHSI() {
   return g_active_p_state ? g_active_p_state->handle_scope_impl : nullptr;
+}
+
+LinearAllocationArea* GoroutineThreadState::GetOldAllocationInfo(
+    IsolateData* data) {
+  return &data->old_allocation_info_;
 }
 
 }  // namespace internal
@@ -271,6 +256,12 @@ void v8_goroutine_p_state_deactivate() {
 void v8_goroutine_p_state_destroy(void* p_state) {
   v8::internal::GoroutineThreadState::DestroyPState(
       static_cast<v8::internal::GoroutinePState*>(p_state));
+}
+
+void* v8_goroutine_p_state_get_isolate_data(void* p_state) {
+  if (!p_state) return nullptr;
+  return static_cast<void*>(
+      static_cast<v8::internal::GoroutinePState*>(p_state)->isolate_data);
 }
 
 bool v8_goroutine_ensure_compiled(v8::Isolate* isolate,

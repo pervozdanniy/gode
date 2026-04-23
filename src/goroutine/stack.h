@@ -52,6 +52,11 @@ class StackAllocator {
   Stack* Alloc();
   void Free(Stack* stack);
 
+  // Maximum number of stacks kept in the free pool.
+  // Stacks beyond this limit are immediately munmap'd to bound memory usage.
+  // 64 stacks × 64KB = 4MB pool max (256KB × 64 = 16MB under ASAN).
+  static constexpr size_t kMaxPoolSize = 64;
+
   // Stats
   size_t allocated_count() const { return allocated_count_; }
   size_t pool_size() const;

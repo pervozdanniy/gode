@@ -89,8 +89,14 @@ void StackAllocator::Free(Stack* stack) {
 
   Mutex::ScopedLock lock(mutex_);
 
-  // Return to pool for reuse
-  pool_.push_back(stack);
+  // Return to pool for reuse, but cap pool size to avoid memory bloat.
+  // When 100K goroutines finish, we don't want to hold 6.8GB of stacks in
+  // the pool — stacks beyond kMaxPoolSize are immediately munmap'd.
+  if (pool_.size() < kMaxPoolSize) {
+    pool_.push_back(stack);
+  } else {
+    delete stack;
+  }
 }
 
 size_t StackAllocator::pool_size() const {

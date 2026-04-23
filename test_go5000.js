@@ -1,5 +1,5 @@
 const {go} = require('goroutine');
-const N = 1000;
+const N = 100;
 
 
 // SharedArrayBuffer + Atomics — единственный безопасный способ
@@ -22,15 +22,16 @@ class User {
 }
 
 function worker() {
-    // const obj = {}
+    const obj = {}
     const arr = [];
-    // const instance = new User();
+    const instance = new User();
     let sum = 0;
     for (let j = 0; j < 1_000_000; j++) {
         sum += j * 10;
         const len = arr.push(sum);
-        // obj['prop'] = sum
-        // obj.curr = arr[len - 1];
+        obj[`prop_${j}`] = sum
+        obj['prop'] = sum
+        obj.curr = arr[len - 1];
     }
     Atomics.add(counter, 0, 1);
 }

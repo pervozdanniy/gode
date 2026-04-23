@@ -42,10 +42,6 @@ extern "C" void v8_goroutine_gc_unpark(void* state);
 extern "C" void v8_goroutine_set_current_gc_state(void* state);
 // Phase 1.3: SeqLock — wait until no shape transition is in flight.
 extern "C" void v8_goroutine_shape_seqlock_wait();
-// Old-Space LAB sync: borrow LocalHeap LAB into per-M IsolateData before run,
-// flush updated top back to LocalHeap after run.
-extern "C" void v8_goroutine_lab_sync_before_run();
-extern "C" void v8_goroutine_lab_sync_after_run();
 // Returns per-M IsolateData* — used to set kRootRegister (r13) on goroutine entry.
 extern "C" void* v8_goroutine_get_isolate_data();
 // Set per-M StackGuard stack limit directly (does NOT touch shared stack_size_).
@@ -122,7 +118,6 @@ void RunG(G* g, v8::Isolate* isolate) {
   tls_current_g = g;
   v8_goroutine_set_current_gc_state(g->gc_state());
 
-  v8_goroutine_lab_sync_before_run();
 
 #if GOROUTINE_ASAN
   // Tell ASAN we're switching FROM the scheduler (pthread) stack
@@ -142,7 +137,6 @@ void RunG(G* g, v8::Isolate* isolate) {
   __sanitizer_finish_switch_fiber(tls_asan_fake_stack, nullptr, nullptr);
 #endif
 
-  v8_goroutine_lab_sync_after_run();
 
   // Back on g0 stack — goroutine is no longer running on this M-thread.
   v8_goroutine_set_current_gc_state(nullptr);
@@ -173,7 +167,6 @@ void YieldG() {
   Runtime::GetInstance()->NotifyGoroutineAvailable();
 
   v8_goroutine_gc_park(v8::Isolate::GetCurrent(), g->gc_state());
-  v8_goroutine_lab_sync_after_run();
 
 #if GOROUTINE_ASAN
   // Switching FROM goroutine mmap stack TO scheduler pthread stack.
@@ -195,7 +188,6 @@ void YieldG() {
     __asm__ volatile("movq %0, %%r13" : : "r"(iso_data) : "r13");
   }
   v8_goroutine_shape_seqlock_wait();
-  v8_goroutine_lab_sync_before_run();
   v8_goroutine_gc_unpark(g->gc_state());
   tls_sched_ctx = t.fctx;
 }

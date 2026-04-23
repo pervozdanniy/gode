@@ -34,6 +34,8 @@ extern "C" void  v8_goroutine_local_heap_destroy(void* lh);
 extern "C" void  v8_goroutine_local_heap_park(void* lh);
 extern "C" void  v8_goroutine_local_heap_unpark(void* lh);
 extern "C" void  v8_goroutine_local_heap_safepoint(void* lh);
+extern "C" void  v8_goroutine_local_heap_replace_old_lab(void* lh, void* isolate_data);
+extern "C" void* v8_goroutine_p_state_get_isolate_data(void* state);
 
 namespace node {
 namespace goroutine {
@@ -86,6 +88,12 @@ void M::ThreadLoop() {
   // Create LocalHeap — starts Parked (GC-safe).
   local_heap_ = v8_goroutine_local_heap_create(isolate);
   v8_goroutine_p_state_activate_with_isolate(v8_state_, isolate);
+
+  // Point LocalHeap's old-space allocator at per-M IsolateData's LAB so that
+  // Ignition's r13-based bump-pointer fast path and the allocator share the
+  // exact same top/limit — eliminates LabSync overhead per goroutine.
+  void* iso_data = v8_goroutine_p_state_get_isolate_data(v8_state_);
+  v8_goroutine_local_heap_replace_old_lab(local_heap_, iso_data);
   // ActivatePState already set the per-M StackGuard limit from the current
   // stack pointer. No need to call SetStackLimit again here.
 
@@ -108,10 +116,15 @@ void M::ThreadLoop() {
       current_g_ = g;
       g->SetState(GState::Grunning);
 
+      // Lazy stack allocation: allocate mmap stack only now that a worker
+      // is actually about to execute this goroutine.  New goroutines arrive
+      // here with stack_==nullptr; resumed goroutines already have a stack.
+      g->AllocateStack();
+
       // Unpark: signals V8 heap access begins; GC must wait for safepoint.
       v8_goroutine_local_heap_unpark(local_heap_);
 
-#if defined(GOROUTINE_TRACE)
+#if GOROUTINE_TRACE == 1
       struct timespec ts_wall_start, ts_wall_end, ts_cpu_start, ts_cpu_end;
       clock_gettime(CLOCK_MONOTONIC, &ts_wall_start);
       clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu_start);
@@ -120,7 +133,7 @@ void M::ThreadLoop() {
 
       RunG(g, isolate);
 
-#if defined(GOROUTINE_TRACE)
+#if GOROUTINE_TRACE == 1
       clock_gettime(CLOCK_MONOTONIC, &ts_wall_end);
       clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu_end);
       double wall_ms = (ts_wall_end.tv_sec - ts_wall_start.tv_sec) * 1000.0 +
@@ -138,6 +151,10 @@ void M::ThreadLoop() {
 
       current_g_ = nullptr;
       if (g->state() == GState::Gdead) {
+        // Release the mmap stack immediately — don't wait for OnAsync to
+        // delete the G object.  This bounds peak stack memory to
+        // (active_workers + pool_size) × kStackSize regardless of queue depth.
+        g->ReleaseStack();
         // v8::Global::~G() calls Reset() which is NOT thread-safe.
         // Enqueue for deletion on main thread (drained in OnAsync).
         std::lock_guard<std::mutex> lock(rt->dead_mutex_);

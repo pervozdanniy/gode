@@ -46,6 +46,9 @@ cd /home/pervozdanniy/code/gode && ...
 | `deps/v8/src/execution/goroutine-local-heap.{h,cc}` | Per-M LocalHeap: register worker threads with V8 GC safepoint |
 | `deps/v8/src/execution/goroutine-gc-roots.{h,cc}` | GC root scanning for yielded goroutine mmap stacks (Phase 1.2) |
 | `deps/v8/src/execution/goroutine-shape-seqlock.{h,cc}` | SeqLock protecting shape transitions during MigrateToMap (Phase 1.3) |
+| `deps/v8/src/heap/heap-allocator.{h,cc}` | Patched: `ReplaceOldSpaceLAB()` for shared LAB; slow-path redirect for M-threads |
+| `deps/v8/src/heap/factory.cc` | Patched: goroutine allocation redirect (AllocateRaw, New, AllocateRawWithAllocationSite) |
+| `deps/v8/src/heap/local-heap.cc` | Patched: goroutine safepoint park/unpark with GC registry hooks |
 | `deps/v8/src/execution/isolate.h` | Patched `thread_local_top()` / `handle_scope_data()` / `handle_scope_implementer()` via `tls_per_m_isolate_data` |
 
 ## Agent Behaviour Rules
@@ -67,6 +70,10 @@ cd /home/pervozdanniy/code/gode && ...
 - **LocalHeap destroy**: must be called from the OWNER worker thread (uses thread-local write barriers); do NOT call from main thread
 - **`isolate_data()` always returns main**: `Isolate::isolate_data()` returns `&isolate_data_` on ALL threads (no per-M dispatch). Only these accessors dispatch via `tls_per_m_isolate_data`: `thread_local_top()`, `handle_scope_data()`, `handle_scope_implementer()`. **NEVER use `isolate->isolate_data()->handle_scope_data_` or `isolate->isolate_data()->thread_local_top_` directly** — always go through the accessor methods. `stack_guard()` is accessed via `g_active_p_state->isolate_data->stack_guard()` in goroutine code.
 - **r13 (kRootRegister)** is set to per-M IsolateData in `goroutine_entry()` and after `YieldG()` resume via inline asm. V8 builtins access IsolateData fields through r13, so this is consistent with `tls_per_m_isolate_data`.
+- **Shared LAB (no sync)**: `ReplaceOldSpaceLAB()` at M-thread init makes LocalHeap's `old_space_allocator_` point at per-M `IsolateData::old_allocation_info_`. Ignition fast path (r13) and LocalHeap share the **same** `LinearAllocationArea` — no manual LAB sync needed. `LabSyncBeforeRun` only syncs `roots_table_` and `marking_flags` after GC (rare). `LabSyncAfterRun` is a no-op.
+- **roots_table_ is a copy**: per-M IsolateData contains a **copy** of main roots_table (~4KB). GC updates only the main copy → must `memcpy` after every safepoint. This is cheap (nanoseconds vs GC milliseconds).
+- **Lock-safepoint deadlock (FIXED)**: any mutex held during V8 allocations must NOT use blocking `mutex.lock()` on goroutine M-threads, because if GC fires the thread is stuck in the kernel and cannot park → GC waits forever. Fix: `v8_goroutine_map_transition_lock()` uses `try_lock()` + `LocalHeap::Safepoint()` spin loop so GC can always proceed. See `goroutine-shape-seqlock.cc`.
+- **Shared FeedbackVectors / no per-M JIT (KI-6)**: goroutines sharing the same JS function share one FeedbackVector → IC pollution → megamorphic slowdown. Fix is Phase 2 (per-M FeedbackVectors + per-M JIT tier-up). Until then, goroutines with heavy allocations are ~5-8x slower than main thread.
 
 ## ASAN Build
 

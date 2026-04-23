@@ -1,6 +1,6 @@
 ## Финальный план реализации
 
-> Последнее обновление: 2026-04-18 (factory.cc allocation fix)
+> Последнее обновление: 2026-04-23 (safepoint-aware map transition mutex; KI-6 добавлен)
 > Статусы: ✅ DONE | 🔨 IN PROGRESS (собрано, не протестировано) | ❌ KNOWN ISSUE | 📋 TODO
 
 ---
@@ -116,16 +116,41 @@ RUNTIME_FUNCTION_RETURNS_TYPE (arguments.h) исправляет isolate в на
 Статус: реализовано и активно (без GVL — критически важно).
 ```
 
-### Old Space LAB sync ✅ DONE
+### Old Space LAB sync ✅ DONE → Shared LAB (zero-sync) ✅ DONE
 
 ```
-Перед RunG:   LocalHeap Old Space LAB → per-M IsolateData
-              JIT fast path (bump pointer через r13) работает без slow path.
-После RunG / при YieldG: обновлённый top → обратно в LocalHeap.
+Было (LAB Sync):
+  Перед RunG:   memcpy LocalHeap LAB top/limit → per-M IsolateData
+  После RunG:   memcpy per-M IsolateData top → обратно в LocalHeap
+  На каждый slow-path: sync_after → allocate → sync_before
 
-Файлы: deps/v8/src/execution/goroutine-thread-state.cc
-        src/goroutine/context.cc
-Статус: реализовано.
+Стало (Shared LAB):
+  ReplaceOldSpaceLAB() при инициализации M-треда пересоздаёт
+  old_space_allocator_ так, что его allocation_info_ указывает прямо
+  на IsolateData::old_allocation_info_. Один и тот же объект в памяти:
+
+    r13 + offset → IsolateData::old_allocation_info_  ← Ignition fast path
+                            ↑
+    LocalHeap::allocator::old_space_allocator_::allocation_info_ (тот же ptr)
+
+  LabSyncAfterRun  → no-op (LAB shared, нечего копировать)
+  LabSyncBeforeRun → только roots_table_ + marking flags sync после GC
+
+  roots_table_ (~4KB) — копия main IsolateData. GC обновляет только main →
+  per-M копии протухают. memcpy после каждого safepoint (наносекунды vs GC мс).
+  
+  marking flags (2 байта) — аналогично: concurrent marking выставляет флаг
+  только в main IsolateData → per-M копия может пропустить write barrier →
+  heap corruption. Синхронизируется вместе с roots.
+
+  Оптимизация roots sync (DEFERRED — diminishing returns):
+    Вариант: научить GC обновлять per-M roots через реестр GoroutinePState.
+    Не стоит делать: 4KB memcpy после GC — наносекунды vs GC миллисекунды.
+
+Файлы: deps/v8/src/heap/heap-allocator.{h,cc}     — ReplaceOldSpaceLAB()
+        deps/v8/src/execution/goroutine-local-heap.cc — v8_goroutine_local_heap_replace_old_lab()
+        deps/v8/src/execution/goroutine-thread-state.{h,cc} — GetOldAllocationInfo(), simplified LabSync
+        src/goroutine/runtime.cc — вызов replace_old_lab при инициализации M
 ```
 
 ---
@@ -217,6 +242,90 @@ RUNTIME_FUNCTION_RETURNS_TYPE (arguments.h) исправляет isolate в на
 ```
 
 ### KI-5: Data race при небезопасном доступе к общим объектам
+
+```
+Проблема: если пользователь без явного мьютекса мутирует объект из горутины
+  одновременно с мэйн тредом (или другой горутиной), возможны:
+  - SIGSEGV (чтение битого указателя при одновременном shape transition)
+  - тихая корrupция данных (race на значение поля)
+
+  Пример:
+    // мэйн тред:
+    obj.b = 2;       // shape transition → новый Map объекта
+
+    // горутина (одновременно):
+    obj.a            // читает map pointer посередине записи → SIGSEGV
+
+Решение: перехват SIGSEGV в обработчике сигнала worker M-треда.
+
+  1. При старте каждого M-треда устанавливаем альтернативный стек (sigaltstack)
+     и обработчик SIGSEGV/SIGBUS.
+
+  2. В обработчике:
+     - Убеждаемся, что адрес падения лежит в куче V8 (heap bounds check).
+     - Если да → это скорее всего data race горутины.
+     - Вызываем uv_async_send в main loop с ошибкой типа
+       "DataRaceError: unsafe concurrent access to shared object in goroutine".
+
+  3. Main loop получает async событие и вызывает
+     process.emit('uncaughtException', err).
+     Это даёт пользователю стандартный хук Node.js для graceful shutdown
+     (логирование, flush, exit).
+
+  4. Горутина/M-тред завершается (longjmp из обработчика или pthread_exit).
+
+Ограничения:
+  - SIGSEGV из JIT-кода не всегда указывает на data race (может быть баг рантайма).
+  - После обработки состояние кучи может быть испорчено → process.exit() обязателен.
+  - Как и в оригинальном Node.js: uncaughtException — это "last resort",
+    после которого нужно перезапускать процесс.
+
+Файлы:
+  src/goroutine/runtime.cc  — установка sigaltstack + SA_ONSTACK при старте M
+  src/goroutine/runtime.cc  — SIGSEGV handler → uv_async_send → main loop
+  lib/goroutine.js          — emit('uncaughtException') или 'unhandledRejection'
+```
+
+### KI-6: Медлительность — shared FeedbackVectors и отсутствие per-M JIT ❌ KNOWN ISSUE (Phase 2)
+
+```
+Диагноз (подтверждён тестом test_go5000.js с GOMAXPROCS=4):
+  Каждая горутина выполняется в ~3-4x медленнее чем на main thread.
+  Причины три, в порядке важности:
+
+  1. Shared FeedbackVector — главный bottleneck.
+     Функция worker() — один JS-объект с одним FeedbackVector на все M-треды.
+     С 4 горутинами, одновременно обновляющими IC-слоты (arr.push, obj.prop),
+     FeedbackVector деградирует до мегаморфного → все запросы идут на slowpath.
+
+       M1: "arr → monomorphic ElementsKind"
+       M2: "arr → другой polymorphic"       ← IC деградирует
+       M3: ещё один вариант               ← мегаморфный
+       → все операции падают на RuntimeCall
+
+  2. Нет per-M JIT / деоптимизации общего кода.
+     TurboFan/Maglev компилирует на основе загрязнённого FeedbackVector
+     → пессимистичные предположения. Деоптимизация в M1 разрушает JIT-код
+     для всех остальных M-тредов.
+
+  3. GC-давление от больших аллокаций.
+     1M элементов в arr.push → backing store растёт экспоненциально:
+     4 → 8 → 16 → ... → 1M элементов → множество realloc→GC циклов.
+     Каждый Mark-Compact: все 4 M-треда паузируются + 4KB roots memcpy + re-LAB.
+
+Наблюдаемые числа (трейс):
+  ~3.5s wall time per goroutine (1M итераций) при 76% CPU utilization.
+  Для чистого Ignition ожидается 300-500ms → overhead 5-8x от GC + IC pollution.
+
+Решение → Фаза 2: Per-M FeedbackVectors + Per-M JIT tier-up.
+  - Каждый M-тред хранит собственную копию FeedbackVector для горячих функций.
+  - IC обновления изолированы → монорформные per-thread → fast path всегда работает.
+  - Деоптимизация в M1 не затрагивает M2..M4.
+  - Детали: секция "Фаза 2: Per-thread JIT cache" ниже.
+
+До Phase 2: горутины корректны, но медленнее main thread при тяжёлых аллокациях.
+  Для pure-compute без большой аллокации (числа, SAB Atomics) — уже работает быстро.
+```
 
 ```
 Проблема: если пользователь без явного мьютекса мутирует объект из горутины

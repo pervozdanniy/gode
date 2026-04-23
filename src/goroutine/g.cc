@@ -27,7 +27,7 @@ G::G(v8::Isolate* isolate,
      v8::Local<v8::Function> entry_func,
      v8::Local<v8::Array> args)
     : goid_(next_goid_.fetch_add(1, std::memory_order_relaxed)),
-      stack_(StackAllocator::GetInstance()->Alloc()),
+      stack_(nullptr),          // Lazy: allocated by worker in AllocateStack()
       state_(GState::Gidle),
       entry_func_(),
       args_(),
@@ -46,7 +46,10 @@ G::G(v8::Isolate* isolate,
     args_.Reset(isolate, args);
   }
 
-  stack_context_ = InitContext(this, stack_->base());
+  // NOTE: stack_ and stack_context_ are NOT initialized here.
+  // AllocateStack() is called by the worker M-thread in M::ThreadLoop()
+  // just before RunG().  This avoids allocating N×64KB stacks up-front when
+  // N goroutines are queued but haven't started running yet.
   gc_state_ = v8_goroutine_gc_alloc();
 }
 
@@ -54,12 +57,29 @@ G::~G() {
   v8_goroutine_gc_free(gc_state_);
   gc_state_ = nullptr;
   if (stack_) {
+    // Safety net: normally ReleaseStack() has already freed the stack
+    // (called by worker after Gdead).  This branch fires only in unusual
+    // paths (e.g. Scheduler::Shutdown draining the queue before execution).
     StackAllocator::GetInstance()->Free(stack_);
     stack_ = nullptr;
   }
 
   entry_func_.Reset();
   args_.Reset();
+}
+
+void G::AllocateStack() {
+  // Idempotent: resumed goroutines already have a stack from their first run.
+  if (stack_) return;
+  stack_ = StackAllocator::GetInstance()->Alloc();
+  stack_context_ = InitContext(this, stack_->base());
+}
+
+void G::ReleaseStack() {
+  if (!stack_) return;
+  StackAllocator::GetInstance()->Free(stack_);
+  stack_ = nullptr;
+  stack_context_ = nullptr;
 }
 
 void G::SetState(GState new_state) {

@@ -121,6 +121,13 @@ class V8_EXPORT_PRIVATE HeapAllocator final {
     return &new_space_allocator_.value();
   }
   MainAllocator* old_space_allocator() { return &old_space_allocator_.value(); }
+
+  // GOROUTINE PATCH: Replace old-space allocator's LAB pointer.
+  // Called from goroutine-local-heap.cc after LocalHeap creation to point
+  // the allocator's LAB at per-M IsolateData::old_allocation_info_ so that
+  // Ignition's r13-based fast path and the allocator share the same top/limit.
+  void ReplaceOldSpaceLAB(LinearAllocationArea* lab);
+
   MainAllocator* trusted_space_allocator() {
     return &trusted_space_allocator_.value();
   }

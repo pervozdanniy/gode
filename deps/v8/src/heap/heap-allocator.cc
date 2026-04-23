@@ -65,6 +65,19 @@ void HeapAllocator::Setup(LinearAllocationArea* new_allocation_info,
   }
 }
 
+// GOROUTINE PATCH: Recreate old_space_allocator_ with a custom LAB pointer
+// so that it shares top/limit with per-M IsolateData::old_allocation_info_
+// (accessed by Ignition via r13). Eliminates LabSync overhead.
+void HeapAllocator::ReplaceOldSpaceLAB(LinearAllocationArea* lab) {
+  // Free existing LAB to avoid leaking pages.
+  if (old_space_allocator_.has_value()) {
+    old_space_allocator_->FreeLinearAllocationArea();
+    old_space_allocator_.reset();
+  }
+  old_space_allocator_.emplace(local_heap_, heap_->old_space(),
+                               MainAllocator::IsNewGeneration::kNo, lab);
+}
+
 void HeapAllocator::SetReadOnlySpace(ReadOnlySpace* read_only_space) {
   read_only_space_ = read_only_space;
 }

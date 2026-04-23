@@ -23,5 +23,8 @@ extern "C" {
   // Cooperative safepoint check between goroutines.
   // Blocks until GC completes if a safepoint was requested.
   void v8_goroutine_local_heap_safepoint(void* lh);
+  // Replace LocalHeap's old-space allocator LAB with per-M IsolateData's LAB.
+  // Call once after create + activate. Eliminates LabSync overhead.
+  void v8_goroutine_local_heap_replace_old_lab(void* lh, void* isolate_data);
 }
 #endif  // V8_EXECUTION_GOROUTINE_LOCAL_HEAP_H_

@@ -12,6 +12,7 @@
 #include "src/common/globals.h"
 #include "src/common/ptr-compr-inl.h"
 #include "src/execution/isolate-utils-inl.h"
+#include "src/execution/goroutine-flag.h"
 #include "src/heap/heap-layout-inl.h"
 #include "src/heap/safepoint.h"
 #include "src/objects/internal-index.h"
@@ -635,6 +636,18 @@ Address StringTable::Data::TryStringToIndexOrLookupExisting(
 Address StringTable::TryStringToIndexOrLookupExisting(Isolate* isolate,
                                                       Address raw_string) {
   Tagged<String> string = Cast<String>(Tagged<Object>(raw_string));
+
+  // GODE: On M-threads r13 points to per-M IsolateData (a standalone
+  // allocation), not to the embedded isolate_data_ of the real Isolate.
+  // Builtins compute Isolate* as r13 - offsetof(Isolate, isolate_data_), so
+  // the pointer they pass here is the per-M IsolateData pointer.
+  // Accessing Isolate fields beyond sizeof(IsolateData) (e.g. string_table_)
+  // would read past the allocation → SIGSEGV.
+  // Fix: on M-threads, substitute the real Isolate stored in TLS.
+  if (v8_goroutine_thread) {
+    isolate = static_cast<Isolate*>(v8_goroutine_real_isolate);
+  }
+
   if (IsInternalizedString(string)) {
     // string could be internalized, if the string table is shared and another
     // thread internalized it.

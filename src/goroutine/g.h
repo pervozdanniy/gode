@@ -42,6 +42,13 @@ class G {
   void SaveContext(void* ctx);
   void RestoreContext();
 
+  // Stack lifecycle: AllocateStack() is called by the worker M-thread just
+  // before RunG(), ReleaseStack() immediately after goroutine reaches Gdead.
+  // Separating stack lifetime from G lifetime avoids allocating N×64KB stacks
+  // up-front when N goroutines are queued but not yet running.
+  void AllocateStack();   // mmap + make_fcontext; no-op if already allocated
+  void ReleaseStack();    // return to pool; clears stack_ and stack_context_
+
   // Panic handling
   [[noreturn]] void Panic(const char* msg);
 

@@ -1,14 +1,14 @@
 const {go} = require('goroutine');
-const N = 100_000;
+const N = 100;
 const sab = new SharedArrayBuffer(4);
 const counter = new Int32Array(sab);
 const start = performance.now();
 
 function worker() {
-    // let sum = 0;
-    // for (let j = 0; j < 1_000_000; j++) {
-    //     sum += j * 10;
-    // }
+    let sum = 0;
+    for (let j = 0; j < 1_000_000; j++) {
+        sum += j * 10;
+    }
     Atomics.add(counter, 0, 1);
 }
 
@@ -27,5 +27,5 @@ function waitAll() {
     }
 }
 
-setTimeout(waitAll, 5000);
+setTimeout(waitAll, 500);
 
