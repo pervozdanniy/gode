@@ -51,7 +51,7 @@ cd /home/pervozdanniy/code/gode && ...
 | `deps/v8/src/execution/goroutine-local-heap.{h,cc}` | Per-M LocalHeap: register worker threads with V8 GC safepoint |
 | `deps/v8/src/execution/goroutine-gc-roots.{h,cc}` | GC root scanning for yielded goroutine mmap stacks (Phase 1.2) |
 | `deps/v8/src/execution/goroutine-shape-seqlock.{h,cc}` | SeqLock protecting shape transitions during MigrateToMap (Phase 1.3) |
-| `deps/v8/src/execution/goroutine-feedback.{h,cc}` | Phase 2 groundwork: `GoroutineFeedbackState` maps (script_id, function_literal_id) → per-M FeedbackVector via PersistentHandles; `.cc` is empty (not yet active) |
+| `deps/v8/src/execution/goroutine-feedback.{h,cc}` | Phase 2 active: `GoroutineFeedbackState` maps unique_id → per-M FeedbackVector via PersistentHandles; `CreatePerMFeedbackVector` clones FV via `FeedbackVector::New`; `GetOrCreate` fast cache lookup from InterpreterEntryTrampoline; `v8_goroutine_create_per_m_feedback` called from BytecodeBudgetInterrupt |
 | `deps/v8/src/heap/heap-allocator.{h,cc}` | Patched: `ReplaceOldSpaceLAB()` for shared LAB; slow-path redirect for M-threads |
 | `deps/v8/src/heap/factory.cc` | Patched: goroutine allocation redirect (AllocateRaw, New, AllocateRawWithAllocationSite) |
 | `deps/v8/src/heap/local-heap.cc` | Patched: goroutine safepoint park/unpark with GC registry hooks |
@@ -62,6 +62,7 @@ cd /home/pervozdanniy/code/gode && ...
 | `deps/v8/src/execution/execution.cc` | Patched: stack-guard uses per-M IsolateData root on M-threads |
 | `deps/v8/src/handles/handles{-inl}.h` | Patched: allows handle creation/usage on goroutine M-threads (bypasses DCHECK) |
 | `deps/v8/src/objects/feedback-vector{-inl}.h` | Patched: IC slot writes (`ComputeHandler`, `SetOptimizedCode`) are skipped on M-threads to prevent shared FV mutation |
+| `deps/v8/src/interpreter/interpreter-assembler.cc` | Patched: `UpdateInterruptBudget` skips shared `FeedbackCell::interrupt_budget` store on M-threads (goroutine flag check via `[r13 + tables_alignment_padding_offset]`) — eliminates MESI cache-line bouncing |
 | `deps/v8/src/objects/map.cc` | Patched: map transitions guarded by `v8_goroutine_map_transition_lock()` |
 | `deps/v8/src/objects/js-objects.cc` | Patched: `MigrateToMap` wrapped in `v8_goroutine_shape_seqlock_begin/end()` |
 | `deps/v8/src/objects/shared-function-info.cc` | Patched: tier-up skipped on M-threads (`v8_goroutine_thread` guard) |
@@ -112,7 +113,7 @@ goprint(...args);       // Goroutine-safe print (enqueues output to main thread;
 - **Shared LAB (no sync)**: `ReplaceOldSpaceLAB()` at M-thread init makes LocalHeap's `old_space_allocator_` point at per-M `IsolateData::old_allocation_info_`. Ignition fast path (r13) and LocalHeap share the **same** `LinearAllocationArea` — no manual LAB sync needed. `LabSyncBeforeRun` only syncs `roots_table_` and `marking_flags` after GC (rare). `LabSyncAfterRun` is a no-op.
 - **roots_table_ is a copy**: per-M IsolateData contains a **copy** of main roots_table (~4KB). GC updates only the main copy → must `memcpy` after every safepoint. This is cheap (nanoseconds vs GC milliseconds).
 - **Lock-safepoint deadlock (FIXED)**: any mutex held during V8 allocations must NOT use blocking `mutex.lock()` on goroutine M-threads, because if GC fires the thread is stuck in the kernel and cannot park → GC waits forever. Fix: `v8_goroutine_map_transition_lock()` uses `try_lock()` + `LocalHeap::Safepoint()` spin loop so GC can always proceed. See `goroutine-shape-seqlock.cc`.
-- **Shared FeedbackVectors / no per-M JIT (KI-6)**: goroutines sharing the same JS function share one FeedbackVector. **Current mitigation**: IC slot writes (`ComputeHandler`, `SetOptimizedCode`) are skipped on M-threads entirely (`feedback-vector{-inl}.h` patches) — prevents IC pollution but goroutines stay at unlearned interpreter state. Phase 2 groundwork exists (`goroutine-feedback.{h,cc}`: per-M FV via PersistentHandles) but `.cc` is empty and not yet wired in. Until Phase 2 lands, goroutines with heavy polymorphic allocations are slower than the main thread.
+- **Shared FeedbackVectors / per-M FV (Phase 2 — ACTIVE)**: goroutines now get per-M FeedbackVector clones via `CreatePerMFeedbackVector` (called lazily from `BytecodeBudgetInterrupt`). `UpdateInterruptBudget` in `interpreter-assembler.cc` skips the shared `FeedbackCell::interrupt_budget` store on M-threads (returns `INT32_MAX/2`) to avoid MESI cache-line bouncing. IC slot writes (`ComputeHandler`, `SetOptimizedCode`) are still skipped on M-threads (`feedback-vector-inl.h` patches). Per-M JIT tier-up is still disabled (Phase 2 TODO).
 - **`v8_goroutine_real_isolate` TLS**: `CEntryStub` computes `Isolate*` as `r13 - kRootRegisterBias`, which resolves to per-M IsolateData (not the real Isolate). `v8_goroutine_real_isolate` holds the correct value. Set in `goroutine-thread.cc`, consumed by the `RUNTIME_FUNCTION` macro in `arguments.h` and in `string-table.cc`. Always set this alongside `v8_goroutine_thread` when activating an M-thread.
 
 ## ASAN Build

@@ -1,7 +1,8 @@
 ## Финальный план реализации
 
-> Последнее обновление: 2026-04-23 (safepoint-aware map transition mutex; KI-6 добавлен)
+> Последнее обновление: 2026-04-28 (Phase 2 partial: per-M FeedbackVector + UpdateInterruptBudget skip → 3.72x scaling)
 > Статусы: ✅ DONE | 🔨 IN PROGRESS (собрано, не протестировано) | ❌ KNOWN ISSUE | 📋 TODO
+> Текущая фаза: **Phase 2 (per-M FeedbackVectors — partial, per-M JIT — TODO)**
 
 ---
 
@@ -286,45 +287,48 @@ RUNTIME_FUNCTION_RETURNS_TYPE (arguments.h) исправляет isolate в на
   lib/goroutine.js          — emit('uncaughtException') или 'unhandledRejection'
 ```
 
-### KI-6: Медлительность — shared FeedbackVectors и отсутствие per-M JIT ❌ KNOWN ISSUE (Phase 2)
+### KI-6: ~~Медлительность — shared FeedbackVectors и отсутствие per-M JIT~~ ✅ FIXED (Phase 2 partial)
 
 ```
-Диагноз (подтверждён тестом test_go5000.js с GOMAXPROCS=4):
-  Каждая горутина выполняется в ~3-4x медленнее чем на main thread.
-  Причины три, в порядке важности:
+Диагноз (подтверждён тестом test_go.js с GOMAXPROCS=4):
+  Каждая горутина выполнялась в ~4.6x медленнее чем на main thread.
+  
+  Корневая причина: UpdateInterruptBudget() в interpreter-assembler.cc
+  выполняет non-atomic read-modify-write в shared FeedbackCell::interrupt_budget
+  на КАЖДОМ JumpLoop bytecode (= каждой итерации цикла). С 4 M-threads
+  это 40M cross-core MESI cache line invalidations → катастрофический bouncing.
+  
+  Результат: 4 потока работали МЕДЛЕННЕЕ чем 1 поток (0.86x вместо 4x).
 
-  1. Shared FeedbackVector — главный bottleneck.
-     Функция worker() — один JS-объект с одним FeedbackVector на все M-треды.
-     С 4 горутинами, одновременно обновляющими IC-слоты (arr.push, obj.prop),
-     FeedbackVector деградирует до мегаморфного → все запросы идут на slowpath.
+Решение (реализовано):
+  1. interpreter-assembler.cc: UpdateInterruptBudget проверяет goroutine flag
+     [r13 + tables_alignment_padding_offset]. На M-threads пропускает store
+     в shared FeedbackCell и возвращает INT32_MAX/2 (budget никогда не fires).
+  
+  2. goroutine-feedback.cc: CreatePerMFeedbackVector реализован —
+     клонирует canonical FeedbackVector через FeedbackVector::New,
+     хранит как PersistentHandle в per-M fv_cache_.
+  
+  3. runtime-internal.cc: BytecodeBudgetInterrupt{WithStackCheck} вызывает
+     v8_goroutine_create_per_m_feedback() для lazy per-M FV creation
+     при первом budget interrupt per function per M-thread.
 
-       M1: "arr → monomorphic ElementsKind"
-       M2: "arr → другой polymorphic"       ← IC деградирует
-       M3: ещё один вариант               ← мегаморфный
-       → все операции падают на RuntimeCall
+Результаты (100 горутин × 10M empty loop):
+  До:    1T=11.1s, 4T=13.0s (0.86x — МЕДЛЕННЕЕ с доп. потоками!)
+  После: 1T=11.9s, 4T=3.2s  (3.72x — 93% parallel efficiency!)
+  Worker threads --jitless baseline: 1T=12.4s, 4T=3.4s (3.64x)
+  
+  Горутины теперь скейлятся ЛУЧШЕ чем worker threads на CPU-bound.
 
-  2. Нет per-M JIT / деоптимизации общего кода.
-     TurboFan/Maglev компилирует на основе загрязнённого FeedbackVector
-     → пессимистичные предположения. Деоптимизация в M1 разрушает JIT-код
-     для всех остальных M-тредов.
+Оставшаяся работа (Phase 2):
+  - Per-M JIT tier-up (TurboFan/Maglev) — пока отключен на M-threads
+  - Деоптимизация в M1 не должна затрагивать M2..M4
+  - IC slot writes ещё скипаются на M-threads (feedback-vector-inl.h patches)
 
-  3. GC-давление от больших аллокаций.
-     1M элементов в arr.push → backing store растёт экспоненциально:
-     4 → 8 → 16 → ... → 1M элементов → множество realloc→GC циклов.
-     Каждый Mark-Compact: все 4 M-треда паузируются + 4KB roots memcpy + re-LAB.
-
-Наблюдаемые числа (трейс):
-  ~3.5s wall time per goroutine (1M итераций) при 76% CPU utilization.
-  Для чистого Ignition ожидается 300-500ms → overhead 5-8x от GC + IC pollution.
-
-Решение → Фаза 2: Per-M FeedbackVectors + Per-M JIT tier-up.
-  - Каждый M-тред хранит собственную копию FeedbackVector для горячих функций.
-  - IC обновления изолированы → монорформные per-thread → fast path всегда работает.
-  - Деоптимизация в M1 не затрагивает M2..M4.
-  - Детали: секция "Фаза 2: Per-thread JIT cache" ниже.
-
-До Phase 2: горутины корректны, но медленнее main thread при тяжёлых аллокациях.
-  Для pure-compute без большой аллокации (числа, SAB Atomics) — уже работает быстро.
+Файлы:
+  deps/v8/src/interpreter/interpreter-assembler.cc — UpdateInterruptBudget skip
+  deps/v8/src/execution/goroutine-feedback.cc — CreatePerMFeedbackVector
+  deps/v8/src/runtime/runtime-internal.cc — BytecodeBudgetInterrupt patch
 ```
 
 ```
@@ -463,7 +467,26 @@ Deadlock был: unpark вне GVL → Running, ждёт GVL → GC deadlock.
 
 ### Фаза 2: Per-thread JIT cache
 
-**2.1 PerThreadJitCache**
+**2.1 Per-M FeedbackVectors** ✅ DONE
+
+```
+Реализовано:
+  - goroutine-feedback.cc: CreatePerMFeedbackVector() клонирует canonical FV
+    через FeedbackVector::New для каждой функции на каждом M-thread.
+  - Хранится как PersistentHandle → GC auto-updates на evacuation.
+  - Вызывается из BytecodeBudgetInterrupt (runtime-internal.cc) — lazy,
+    только при первом budget interrupt per function per M-thread.
+  - GetOrCreate() в InterpreterEntryTrampoline → fast cache lookup.
+  - UpdateInterruptBudget (interpreter-assembler.cc) пропускает shared
+    FeedbackCell store на M-threads → eliminates cache line bouncing.
+
+Файлы:
+  deps/v8/src/execution/goroutine-feedback.{h,cc}
+  deps/v8/src/interpreter/interpreter-assembler.cc
+  deps/v8/src/runtime/runtime-internal.cc
+```
+
+**2.2 Per-M JIT tier-up** 📋 TODO
 
 ```
 Новые файлы: src/execution/per-thread-jit-cache.h/.cc
@@ -1031,33 +1054,3 @@ NODE_GOMAXPROCS → CO_MAXPROCS
 Все семантические изменения к этому моменту уже завершены.
 Это чисто механическая операция — grep/sed + проверка компиляции.
 ```
-## Optimization 1
-Plan: Fix 3x goroutine overhead for trivial JS workloads
-The 3x slowdown comes from multiple layers of per-goroutine and per-call overhead that don't exist in worker threads. Workers get a clean V8 Isolate with zero coordination. Goroutines pay for: (1) a C function call on every JS function entry via v8_goroutine_resolve_feedback, (2) active tracing syscalls, (3) fcontext + HSD + stack-limit ceremony per goroutine, and (4) semaphore/mutex/async coordination. The plan identifies each source and proposes concrete fixes.
-Steps
-Disable GOROUTINE_TRACE in runtime.cc. Line 11 has #define GOROUTINE_TRACE 1 — this adds 2× clock_gettime + syscall(SYS_gettid) + fprintf on every single goroutine execution. Comment it out or set to 0. This alone may account for a significant chunk of the gap.
-On goroutine threads, replace the per-call linear search in GetOrCreate (goroutine-feedback.cc line 41) with a hash map keyed on {script_id, function_literal_id}. The comment says "n is typically ≤ 10" but even O(10) with two field comparisons per entry on every call adds up. An absl::flat_hash_map or std::unordered_map makes lookup O(1). Alternatively, cache the resolved FV pointer directly on the per-M FeedbackCell or JSFunction slot to avoid the lookup entirely on repeat calls.
-Eliminate the CallCFunction to v8_goroutine_resolve_feedback on the main-thread fast path in builtins-x64.cc (lines 1187–1202). The current code does push×4 + PrepareCallCFunction + CallCFunction + pop×4 on every JS function call, even on the main thread where it's a no-op. Replace this with an inline TLS check: load v8_goroutine_thread (initial-exec TLS, single movb fs:[offset], reg), branch over the C call when false. This removes ~20 instructions from the main-thread hot path and avoids pipeline flush from the C call.
-Reduce per-goroutine RunG ceremony in context.cc. Currently RunG does: save_hsd + restore_hsd/force_new_handle_block + set_stack_limit + set_current_gc_state + fcontext jump + save_hsd + restore_hsd + set_stack_limit again. For fire-and-forget goroutines (no yield), consider a fast-path that skips HSD save/restore on the return side when the goroutine completed (state == Gdead). Also, v8_goroutine_set_stack_limit does a TLS lookup + null check on every call — inline the StackGuard write when the per-M state pointer is already in hand.
-Batch dead-goroutine cleanup and remove per-goroutine uv_async_send in runtime.cc (line 173). Currently every completed goroutine does: dead_mutex_.lock() + push_back + dead_mutex_.unlock() + uv_async_send (eventfd write). Move the uv_async_send outside the inner loop (after draining all available goroutines) instead of per-goroutine. The dead queue push can use a lock-free MPSC queue to avoid the mutex entirely.
-Profile BytecodeBudgetInterrupt on goroutine threads. The interrupt budget lives in FeedbackCell (per-M via goroutine-feedback.cc). When budget reaches zero, Runtime_BytecodeBudgetInterruptWithStackCheck_Ignition fires. On goroutine threads this may attempt tiering or other expensive operations. Confirm whether the per-M FeedbackCell budget is initialized to a very large value (the comment at line 135 of goroutine-thread-state.cc mentions this but no code follows). If not, set FeedbackCell::kInterruptBudgetOffset to INT_MAX in GoroutineFeedbackState::GetOrCreate after creating the new FeedbackVector.
-Further Considerations
-Measurement methodology — Are you comparing 100 goroutines on N M-threads vs 100 worker threads (each with its own Isolate)? If N < 100, the serialization on M-threads alone explains the gap. Confirm GOMAXPROCS matches the worker thread count.
-uv_sem_wait/uv_sem_post scalability — With 100 goroutines dispatched rapidly, the semaphore becomes a bottleneck (kernel futex contention). Consider replacing with a per-M condition variable or eventfd, or batching: post once per Schedule batch rather than per goroutine via NotifyGoroutineAvailable.
-Stack allocation mutex — StackAllocator uses a global Mutex (stack.h line 71). For 100 goroutines all allocating stacks, this serializes. Consider per-M stack pools or lock-free pooling.
-
-## Optimization 2
-
-Plan: Diagnose 2.5× Goroutine Slowdown vs Worker Threads
-The goroutine runtime introduces several per-call and per-allocation overheads that cumulatively explain the 2.5× slowdown. Based on code analysis, the primary bottlenecks are: (1) a C function call on every JS function invocation for per-M FeedbackVector resolution, (2) expensive LAB flush/steal cycles on every allocation slow-path, (3) a global allocation mutex serializing all M-thread allocations, and (4) GC registry mutex contention in Park/Unpark on every YieldG. Below is a prioritized breakdown.
-Steps
-Eliminate per-call v8_goroutine_resolve_feedback C call overhead. In builtins-x64.cc:1173–1201, every JS function call on M-threads does push/push/push/push → PrepareCallCFunction → CallCFunction → pop/pop/pop/pop — ~20 instructions + TLS lookup + linear search in GoroutineFeedbackState::GetOrCreate (goroutine-feedback.cc:41). Replace with an inline assembly fast-path: cache the per-M FV in a dedicated slot on the closure or use a per-M hash table with an inline TLS check that avoids the C call when the FV is already cached.
-Reduce allocation slow-path cost: LabSyncAfterRun + LabSyncBeforeRun pair on every Factory::AllocateRaw. Three patches in factory.cc:310, 346, 392 each do v8_goroutine_lab_sync_after_run() (copy new→old, zero new) then v8_goroutine_lab_sync_before_run() (GC gen check, old→new copy, zero old). This is ~6 struct copies per slow-path allocation. Since ReplaceOldSpaceLAB already shares the LAB pointer, consider removing the sync dance and letting CSA fast-path bump old_allocation_info_ directly (it's already the same pointer via ReplaceOldSpaceLAB).
-Remove or reduce g_goroutine_alloc_mutex contention. goroutine-thread-state.cc:484 declares a global std::mutex serializing all M-thread allocation slow-paths. With multiple goroutines allocating heavily, this becomes a serialization bottleneck. Since each M-thread already has its own LocalHeap with per-thread LABs, evaluate whether the cross-M contention is on OldSpace::mutex() (page allocation) where MainAllocator already takes a lock (main-allocator.cc:458) — potentially double-locking.
-Reduce GC registry mutex overhead in YieldG/resume. YieldG calls v8_goroutine_gc_park → GoroutineGCRegistry::Park → mutex_.lock() + memcpy(ThreadLocalTop) + vector push. Resume calls gc_unpark → mutex_.lock() + std::remove (O(n) scan) + memcpy back. On goroutine-gc-roots.cc:49–103, use a lock-free concurrent data structure or per-M slot to avoid the O(n) vector scan and mutex contention on every yield/resume.
-Audit TLS access frequency in hot paths. thread_local_top() and handle_scope_data() in isolate.h:1343, 1408 do a TLS load + null-check on every access. While initial-exec TLS is fast (~1 instruction), these are called dozens of times per bytecode handler dispatch. Confirm via profiling whether the cumulative cost is significant; if so, consider caching the per-M IsolateData* in a callee-saved register across interpreter dispatch.
-Verify the CSA young-gen redirect is working end-to-end. The is_goroutine_m_thread_ flag in builtins-x64.cc:1179 is only checked for FeedbackVector resolution, but young-gen CSA AllocateInYoungGeneration builtins still attempt bump-pointer on new_allocation_info_, which is populated from old-space via LabSyncBeforeRun (goroutine-thread-state.cc:266). Confirm CSA Allocate builtins for young-gen check is_goroutine_m_thread_ and redirect to old-space runtime call, not silently allocating into the shared SemiSpace.
-Further Considerations
-Per-M FeedbackVector: inline vs C-call. The current approach calls into C on every function entry. An alternative is to pre-install per-M FVs into closures at goroutine creation time (clone closures with per-M FVs), eliminating the runtime dispatch entirely — at the cost of more memory per goroutine.
-Profiling methodology. The 1600ms vs 660ms comparison is crucial — is the benchmark CPU-bound (object allocation, property access) or I/O-bound? An allocation-heavy benchmark would amplify Factory::AllocateRaw patches and the alloc mutex; a property-access-heavy one would amplify IC/FeedbackVector and shape-seqlock costs. A perf record / perf stat on the specific benchmark would confirm which hotspot dominates.
-Context switch overhead is likely NOT the bottleneck. jump_fcontext is ~10ns, and the surrounding HSD save/restore, r13 set, and seqlock wait (context.cc:101–158) add maybe ~50ns total — negligible unless there are millions of yields per second.
