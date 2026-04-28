@@ -4,6 +4,9 @@
 
 #include "src/execution/goroutine-thread-state.h"
 
+#include <atomic>
+#include <unistd.h>
+#include <sys/syscall.h>
 #include "src/execution/goroutine-flag.h"
 #include "src/execution/isolate.h"
 #include "src/execution/isolate-data.h"
@@ -99,6 +102,10 @@ GoroutinePState* GoroutineThreadState::CreatePState(Isolate* isolate) {
   p_data->new_allocation_info_.Reset(kNullAddress, kNullAddress);
   p_data->old_allocation_info_.Reset(kNullAddress, kNullAddress);
 
+  // Repurpose tables_alignment_padding_[0] as is_goroutine_thread flag.
+  // Will be set to 1 in ActivatePState(). Main IsolateData has it as 0.
+  p_data->tables_alignment_padding_[0] = 0;
+
   // Per-M interrupt budget: initialise to a large positive value so the
   // budget never reaches zero and BytecodeBudgetInterrupt is never triggered
   // from goroutine M-threads. Since this field lives in the per-M IsolateData
@@ -124,6 +131,19 @@ void GoroutineThreadState::DestroyPState(GoroutinePState* state) {
 }
 
 void GoroutineThreadState::ActivatePState(GoroutinePState* state) {
+  // GOROUTINE: Set is_goroutine_thread flag in per-M IsolateData.
+  // This byte is checked inline in InterpreterEntryTrampoline for fast-path.
+  state->isolate_data->tables_alignment_padding_[0] = 1;
+
+  static std::atomic<int> activate_count{0};
+  int count = activate_count.fetch_add(1, std::memory_order_relaxed);
+  if (count < 5) {
+    fprintf(stderr, "[GOROUTINE] ActivatePState #%d, tid=%d, flag_addr=%p, flag_value=%d\n",
+            count, (int)syscall(SYS_gettid),
+            (void*)&state->isolate_data->tables_alignment_padding_[0],
+            (int)state->isolate_data->tables_alignment_padding_[0]);
+  }
+
   g_active_p_state = state;
   v8_goroutine_thread = true;
   tls_per_m_isolate_data = state->isolate_data;
@@ -141,6 +161,9 @@ void GoroutineThreadState::ActivatePState(GoroutinePState* state) {
 }
 
 void GoroutineThreadState::DeactivatePState() {
+  if (g_active_p_state) {
+    g_active_p_state->isolate_data->tables_alignment_padding_[0] = 0;
+  }
   g_active_p_state = nullptr;
   v8_goroutine_thread = false;
   tls_per_m_isolate_data = nullptr;
@@ -372,26 +395,89 @@ void* v8_goroutine_get_current_hsi() {
   return static_cast<void*>(v8::internal::GetCurrentHSI());
 }
 
-}  // extern "C"
-
-// ---- Goroutine heap allocation mutex ----
-// Serialises LocalHeap::AllocateRawWith calls between M-threads.
-// V8's OldSpace internals (page allocation, MemoryChunk metadata, concurrent
-// marking state) are not designed for >1 background thread allocating heavily
-// at the same time. This mutex ensures only one M-thread is inside V8's
-// allocation slow-path at a time. Main thread is NOT affected (it never
-// enters the v8_goroutine_thread path).
-#include <mutex>
-static std::mutex g_goroutine_alloc_mutex;
-
-extern "C" {
-
-void v8_goroutine_alloc_lock() {
-  g_goroutine_alloc_mutex.lock();
+// Returns opaque StackGuard* for the current M-thread.
+// Call once at RunG start, then use v8_goroutine_set_stack_limit_direct()
+// to avoid repeated TLS lookups of g_active_p_state.
+void* v8_goroutine_get_stack_guard() {
+  if (!v8::internal::GoroutineThreadState::IsActive()) return nullptr;
+  return static_cast<void*>(
+      v8::internal::GoroutineThreadState::GetIsolateData()->stack_guard());
 }
 
-void v8_goroutine_alloc_unlock() {
-  g_goroutine_alloc_mutex.unlock();
+// Set stack limit on a previously obtained StackGuard* (no TLS lookup).
+void v8_goroutine_set_stack_limit_direct(void* sg_ptr, uintptr_t limit) {
+  if (!sg_ptr) return;
+  static_cast<v8::internal::StackGuard*>(sg_ptr)->SetStackLimit(limit);
+}
+
+// ---- Combined RunG ceremony functions ----
+// Reduces 5+ extern C calls to 2, cutting per-goroutine overhead.
+
+// Called before jump_fcontext in RunG.
+// Saves g0 HSD → g0_hsd_buf, restores G's HSD (or forces new block),
+// sets goroutine stack limit, sets GC state TLS.
+// Returns opaque StackGuard* for use in run_exit.
+void* v8_goroutine_run_enter(v8::Isolate* isolate,
+                              void* g0_hsd_buf,
+                              const void* g_hsd_buf,
+                              bool has_saved_hsd,
+                              uintptr_t g_stack_bottom,
+                              void* gc_state) {
+  using namespace v8::internal;
+  auto* i_isolate = reinterpret_cast<Isolate*>(isolate);
+
+  // Save g0's HandleScopeData.
+  GoroutineThreadState::SaveHSD(i_isolate, g0_hsd_buf);
+
+  // Restore G's HSD (resuming) or force a fresh handle block (new G).
+  if (has_saved_hsd) {
+    GoroutineThreadState::RestoreHSD(i_isolate, g_hsd_buf);
+  } else {
+    GoroutineThreadState::ForceNewHandleBlock(i_isolate);
+  }
+
+  // Get StackGuard once (single TLS lookup).
+  StackGuard* sg = GoroutineThreadState::IsActive()
+      ? GoroutineThreadState::GetIsolateData()->stack_guard()
+      : nullptr;
+
+  // Set goroutine mmap stack limit.
+  if (sg) sg->SetStackLimit(g_stack_bottom + 8192);
+
+  // Set GC state TLS for safepoint hooks.
+  // (v8_goroutine_set_current_gc_state is called from runtime.cc now,
+  //  but we also accept it here for the grouped API.)
+  extern void v8_goroutine_set_current_gc_state(void*);
+  v8_goroutine_set_current_gc_state(gc_state);
+
+  return static_cast<void*>(sg);
+}
+
+// Called after jump_fcontext returns in RunG.
+// Saves G's HSD (if alive), restores g0 HSD, restores M-thread stack limit.
+void v8_goroutine_run_exit(v8::Isolate* isolate,
+                            void* sg_ptr,
+                            const void* g0_hsd_buf,
+                            void* g_hsd_buf,
+                            bool g_is_dead,
+                            uintptr_t sp) {
+  using namespace v8::internal;
+  auto* i_isolate = reinterpret_cast<Isolate*>(isolate);
+
+  // Save G's HSD only if goroutine will be resumed.
+  if (!g_is_dead) {
+    GoroutineThreadState::SaveHSD(i_isolate, g_hsd_buf);
+  }
+
+  // Restore g0's HSD.
+  GoroutineThreadState::RestoreHSD(i_isolate, g0_hsd_buf);
+
+  // Restore M-thread OS stack limit.
+  if (sg_ptr) {
+    static_cast<StackGuard*>(sg_ptr)->SetStackLimit(sp - (900 * 1024));
+  }
 }
 
 }  // extern "C"
+
+

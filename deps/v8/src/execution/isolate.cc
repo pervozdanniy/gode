@@ -4132,6 +4132,11 @@ Isolate* Isolate::Allocate(IsolateGroup* group) {
   // IsolateAllocator manages the virtual memory resources for the Isolate.
   Isolate* isolate = new (isolate_ptr) Isolate(group);
 
+  // GOROUTINE PATCH: Ensure M-thread flag is 0 on main isolate.
+  // tables_alignment_padding_[0] is repurposed as is_goroutine_m_thread;
+  // per-M copies set it to 1 in CreatePState(). Main must be 0.
+  isolate->isolate_data_.tables_alignment_padding_[0] = 0;
+
 #ifdef DEBUG
   non_disposed_isolates_++;
 #endif  // DEBUG
@@ -4222,6 +4227,7 @@ Isolate::Isolate(IsolateGroup* isolate_group)
       stack_size_(v8_flags.stack_size * KB) {
   TRACE_ISOLATE(constructor);
   CheckIsolateLayout();
+
 
   // ThreadManager is initialized early to support locking an isolate
   // before it is entered.

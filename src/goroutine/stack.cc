@@ -69,17 +69,28 @@ StackAllocator* StackAllocator::GetInstance() {
   return &instance;
 }
 
-Stack* StackAllocator::Alloc() {
-  Mutex::ScopedLock lock(mutex_);
+// Per-thread stack pool — zero-contention fast path for Alloc/Free.
+static thread_local std::vector<Stack*> tls_stack_pool;
 
-  // Try to reuse from pool
-  if (!pool_.empty()) {
-    Stack* stack = pool_.back();
-    pool_.pop_back();
+Stack* StackAllocator::Alloc() {
+  // Fast path: TLS pool (no mutex, no contention).
+  if (!tls_stack_pool.empty()) {
+    Stack* stack = tls_stack_pool.back();
+    tls_stack_pool.pop_back();
     return stack;
   }
 
-  // Allocate new stack
+  // Slow path: global pool under mutex.
+  {
+    Mutex::ScopedLock lock(mutex_);
+    if (!pool_.empty()) {
+      Stack* stack = pool_.back();
+      pool_.pop_back();
+      return stack;
+    }
+  }
+
+  // Allocate new stack (no lock held — mmap is thread-safe).
   allocated_count_++;
   return new Stack();
 }
@@ -87,11 +98,14 @@ Stack* StackAllocator::Alloc() {
 void StackAllocator::Free(Stack* stack) {
   if (!stack) return;
 
-  Mutex::ScopedLock lock(mutex_);
+  // Fast path: TLS pool.
+  if (tls_stack_pool.size() < kMaxPoolSize) {
+    tls_stack_pool.push_back(stack);
+    return;
+  }
 
-  // Return to pool for reuse, but cap pool size to avoid memory bloat.
-  // When 100K goroutines finish, we don't want to hold 6.8GB of stacks in
-  // the pool — stacks beyond kMaxPoolSize are immediately munmap'd.
+  // TLS pool full — try global pool.
+  Mutex::ScopedLock lock(mutex_);
   if (pool_.size() < kMaxPoolSize) {
     pool_.push_back(stack);
   } else {

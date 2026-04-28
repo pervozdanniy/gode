@@ -8,7 +8,7 @@
 #include <time.h>
 
 // Uncomment to enable per-goroutine execution tracing:
-#define GOROUTINE_TRACE 1
+#define GOROUTINE_TRACE 0
 
 // Global V8 Lock — serialises concurrent goroutine execution until
 // per-thread JIT cache (Phase 2) makes true parallelism safe.
@@ -37,12 +37,25 @@ extern "C" void  v8_goroutine_local_heap_safepoint(void* lh);
 extern "C" void  v8_goroutine_local_heap_replace_old_lab(void* lh, void* isolate_data);
 extern "C" void* v8_goroutine_p_state_get_isolate_data(void* state);
 
+// Per-M FeedbackVector state (goroutine-feedback.cc).
+extern "C" void  v8_goroutine_feedback_state_create(void* isolate);
+extern "C" void  v8_goroutine_feedback_state_destroy();
+
+// GC state TLS — cleared after RunG returns to g0 (moved from context.cc).
+extern "C" void  v8_goroutine_set_current_gc_state(void* state);
+
+// Set M-thread id for GC registry per-M slot indexing (goroutine-gc-roots.cc).
+extern "C" void  v8_goroutine_gc_set_m_id(uint32_t id);
+
 namespace node {
 namespace goroutine {
 
 // ---- M (Machine) ----
 
-M::M(uint32_t id) : id_(id) {}
+M::M(uint32_t id) : id_(id) {
+  dead_batch_.reserve(kDeadBatchSize);
+}
+
 M::~M() { DestroyV8State(); }
 
 void M::InitV8State(v8::Isolate* isolate) {
@@ -56,6 +69,19 @@ void M::DestroyV8State() {
   v8_state_ = nullptr;
 }
 
+void M::FlushDeadBatch() {
+  if (dead_batch_.empty()) return;
+
+  Runtime* rt = runtime_;
+  {
+    std::lock_guard<std::mutex> lock(rt->dead_mutex_);
+    rt->dead_queue_.insert(rt->dead_queue_.end(),
+                           dead_batch_.begin(),
+                           dead_batch_.end());
+  }
+  dead_batch_.clear();
+  uv_async_send(&rt->async_handle_);
+}
 
 void M::StartThread(Runtime* rt) {
   runtime_ = rt;
@@ -89,6 +115,9 @@ void M::ThreadLoop() {
   local_heap_ = v8_goroutine_local_heap_create(isolate);
   v8_goroutine_p_state_activate_with_isolate(v8_state_, isolate);
 
+  // Set M-thread id for GC registry per-M slot indexing.
+  v8_goroutine_gc_set_m_id(id_);
+
   // Point LocalHeap's old-space allocator at per-M IsolateData's LAB so that
   // Ignition's r13-based bump-pointer fast path and the allocator share the
   // exact same top/limit — eliminates LabSync overhead per goroutine.
@@ -97,6 +126,10 @@ void M::ThreadLoop() {
   // ActivatePState already set the per-M StackGuard limit from the current
   // stack pointer. No need to call SetStackLimit again here.
 
+  // Create per-M FeedbackVector state so each M-thread has its own IC slots.
+  v8_goroutine_feedback_state_create(
+      reinterpret_cast<void*>(isolate));
+
   while (running_.load()) {
     // ---- Parked: waiting for work signal (GC-safe) ----
     rt->sleeping_workers_.fetch_add(1, std::memory_order_relaxed);
@@ -104,10 +137,12 @@ void M::ThreadLoop() {
     rt->sleeping_workers_.fetch_sub(1, std::memory_order_relaxed);
     if (!running_.load()) break;
 
+    // Unpark once before draining the batch.
+    v8_goroutine_local_heap_unpark(local_heap_);
+
     // Inner loop: drain goroutines while available.
     int count = 0;
     while (running_.load()) {
-      // FindRunnable while Parked — no V8 heap access, GC-safe.
       Scheduler* sched = Scheduler::GetInstance();
       G* g = sched->FindRunnable(id_);
       if (!g) break;
@@ -120,9 +155,6 @@ void M::ThreadLoop() {
       // is actually about to execute this goroutine.  New goroutines arrive
       // here with stack_==nullptr; resumed goroutines already have a stack.
       g->AllocateStack();
-
-      // Unpark: signals V8 heap access begins; GC must wait for safepoint.
-      v8_goroutine_local_heap_unpark(local_heap_);
 
 #if GOROUTINE_TRACE == 1
       struct timespec ts_wall_start, ts_wall_end, ts_cpu_start, ts_cpu_end;
@@ -147,34 +179,38 @@ void M::ThreadLoop() {
               wall_ms, cpu_ms, cpu_util);
 #endif
 
-      v8_goroutine_local_heap_park(local_heap_);
-
+      // Goroutine returned to g0 — clear GC state TLS so safepoint hooks
+      // don't try to park a non-running goroutine.
+      v8_goroutine_set_current_gc_state(nullptr);
       current_g_ = nullptr;
       if (g->state() == GState::Gdead) {
-        // Release the mmap stack immediately — don't wait for OnAsync to
-        // delete the G object.  This bounds peak stack memory to
-        // (active_workers + pool_size) × kStackSize regardless of queue depth.
         g->ReleaseStack();
-        // v8::Global::~G() calls Reset() which is NOT thread-safe.
-        // Enqueue for deletion on main thread (drained in OnAsync).
-        std::lock_guard<std::mutex> lock(rt->dead_mutex_);
-        rt->dead_queue_.push_back(g);
+        // Accumulate dead goroutines in local batch to reduce global queue
+        // contention and async overhead. Flush when batch reaches 16.
+        dead_batch_.push_back(g);
+        if (dead_batch_.size() >= kDeadBatchSize) {
+          FlushDeadBatch();
+        }
       }
 
-      // Send uv_async after each goroutine so the main thread can drain the
-      // dead-G queue and check the Go-style GC trigger mid-batch.
-      // uv_async_send is coalescent: N sends → at most 1 OnAsync per event-loop
-      // iteration, so there is no amplification. Cost is one eventfd write (~ns).
-      uv_async_send(&rt->async_handle_);
+      // Cooperative GC safepoint between goroutines (~1ns if no GC pending).
+      v8_goroutine_local_heap_safepoint(local_heap_);
     }  // end inner while
+
+    // Park before sleeping — GC-safe while waiting for next sem_post.
+    v8_goroutine_local_heap_park(local_heap_);
   }
 
-  // ThreadLoop exiting. Destroy LocalHeap from THIS (worker) thread — required
+  // ThreadLoop exiting. Flush any remaining dead goroutines from local batch.
+  FlushDeadBatch();
+
+  // Destroy LocalHeap from THIS (worker) thread — required
   // because LocalHeap::~LocalHeap() uses thread-local write barriers and
   // Isolate::Current() that belong to this M thread.
   // This is safe because Shutdown() calls SignalStop() for ALL workers first,
   // then joins them all — so the main thread is NOT blocked waiting for us
   // while we're here doing cleanup.
+  v8_goroutine_feedback_state_destroy();
   v8_goroutine_p_state_deactivate();
   v8_goroutine_local_heap_destroy(local_heap_);
   local_heap_ = nullptr;

@@ -22,16 +22,16 @@ class User {
 }
 
 function worker() {
-    const obj = {}
+    // const obj = {}
     const arr = [];
-    const instance = new User();
+    // const instance = new User();
     let sum = 0;
     for (let j = 0; j < 1_000_000; j++) {
         sum += j * 10;
         const len = arr.push(sum);
-        obj[`prop_${j}`] = sum
-        obj['prop'] = sum
-        obj.curr = arr[len - 1];
+        // obj[`prop_${j}`] = sum
+        // obj['prop'] = sum
+        // obj.curr = arr[len - 1];
     }
     Atomics.add(counter, 0, 1);
 }
@@ -44,7 +44,7 @@ function waitAll() {
     const done = Atomics.load(counter, 0);
     if (done < N) {
         console.log('Curr', done);
-        setTimeout(waitAll, 500);
+        setTimeout(waitAll, 100);
     } else {
         const took = performance.now() - start;
         console.log(`All ${done} goroutines done OK in ${took.toFixed(0)} ms`);

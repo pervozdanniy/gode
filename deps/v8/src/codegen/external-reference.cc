@@ -504,6 +504,12 @@ FUNCTION_REFERENCE(write_barrier_shared_marking_from_code_function,
 FUNCTION_REFERENCE(shared_barrier_from_code_function,
                    WriteBarrier::SharedFromCode)
 
+// Goroutine: per-M FeedbackVector resolver (goroutine-feedback.cc).
+extern "C" uintptr_t v8_goroutine_resolve_feedback(uintptr_t closure_raw,
+                                                    uintptr_t fv_raw);
+FUNCTION_REFERENCE(goroutine_resolve_feedback_function,
+                   v8_goroutine_resolve_feedback)
+
 FUNCTION_REFERENCE(insert_remembered_set_function,
                    Heap::InsertIntoRememberedSetFromCode)
 

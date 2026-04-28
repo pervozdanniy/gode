@@ -23,8 +23,7 @@
 #include "src/heap/local-heap.h"
 #include "src/heap/local-heap-inl.h"
 
-extern "C" void v8_goroutine_alloc_lock();
-extern "C" void v8_goroutine_alloc_unlock();
+
 #include "src/objects/free-space-inl.h"
 
 namespace v8 {

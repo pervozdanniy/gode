@@ -29,11 +29,15 @@ cd /home/pervozdanniy/code/gode && ...
 - **Build (Release)**: `ninja -C out/Release node -j8`
 - **Build (ASAN)**: `ninja -C out/Asan node -j8`
 - **Test binary**: `./node` (symlink to `out/Release/node`)
+- **Worker threads**: Set via `GOMAXPROCS` environment variable (default 1, max 256)
 
 ## Key Source Files
 
 | File | Description |
 |------|-------------|
+| `src/goroutine_wrap.cc` | Node.js C++ binding exposing goroutine API to JavaScript (`go`, `yield`, `goid`, `threadid`, `goprint`) |
+| `lib/goroutine.js` | Public JavaScript API for goroutines; exports `go`, `goyield`, `goid`, `threadid`, `goprint` |
+| `lib/internal/goroutine.js` | Internal implementation wrapping `internalBinding('goroutine')` |
 | `src/goroutine/runtime.cc` | M threads, Runtime, Shutdown (two-phase: SignalStop all → JoinThread all) |
 | `src/goroutine/runtime.h` | M + Runtime declarations |
 | `src/goroutine/context.cc` | RunG / YieldG, fcontext switching, ASAN fiber annotations |
@@ -41,15 +45,50 @@ cd /home/pervozdanniy/code/gode && ...
 | `src/goroutine/scheduler.cc` | Local + global queue, work-stealing |
 | `src/goroutine/stack.{h,cc}` | Stack allocation/pooling (mmap stacks; 64KB default, 256KB ASAN) |
 | `src/goroutine/channel.{h,cc}` | Channel for inter-goroutine communication |
-| `deps/v8/src/execution/goroutine-flag.h` | Thin bridge header — the ONLY goroutine include allowed in V8 files |
+| `deps/v8/src/execution/goroutine-flag.h` | Thin bridge header — the ONLY goroutine include allowed in V8 files; declares `v8_goroutine_thread` and `v8_goroutine_real_isolate` TLS |
+| `deps/v8/src/execution/goroutine-thread.{h,cc}` | Defines `v8_goroutine_thread` and `v8_goroutine_real_isolate` TLS vars; `goroutine-thread.h` re-exports `goroutine-flag.h` |
 | `deps/v8/src/execution/goroutine-thread-state.{h,cc}` | Per-M IsolateData, HSD save/restore, `tls_per_m_isolate_data` TLS |
 | `deps/v8/src/execution/goroutine-local-heap.{h,cc}` | Per-M LocalHeap: register worker threads with V8 GC safepoint |
 | `deps/v8/src/execution/goroutine-gc-roots.{h,cc}` | GC root scanning for yielded goroutine mmap stacks (Phase 1.2) |
 | `deps/v8/src/execution/goroutine-shape-seqlock.{h,cc}` | SeqLock protecting shape transitions during MigrateToMap (Phase 1.3) |
+| `deps/v8/src/execution/goroutine-feedback.{h,cc}` | Phase 2 groundwork: `GoroutineFeedbackState` maps (script_id, function_literal_id) → per-M FeedbackVector via PersistentHandles; `.cc` is empty (not yet active) |
 | `deps/v8/src/heap/heap-allocator.{h,cc}` | Patched: `ReplaceOldSpaceLAB()` for shared LAB; slow-path redirect for M-threads |
 | `deps/v8/src/heap/factory.cc` | Patched: goroutine allocation redirect (AllocateRaw, New, AllocateRawWithAllocationSite) |
 | `deps/v8/src/heap/local-heap.cc` | Patched: goroutine safepoint park/unpark with GC registry hooks |
+| `deps/v8/src/heap/heap.cc` | Patched: GC safepoint hooks (`v8_goroutine_safepoint_park/unpark`); GC root scanning for yielded stacks |
+| `deps/v8/src/heap/collection-barrier.cc` | Patched: M-threads skip `ExecuteWhileParked` callback (mmap stack frames not on system stack → SIGSEGV in conservative GC) |
 | `deps/v8/src/execution/isolate.h` | Patched `thread_local_top()` / `handle_scope_data()` / `handle_scope_implementer()` via `tls_per_m_isolate_data` |
+| `deps/v8/src/execution/arguments.h` | Patched: `RUNTIME_FUNCTION` macro overrides computed `Isolate*` with `v8_goroutine_real_isolate` on M-threads |
+| `deps/v8/src/execution/execution.cc` | Patched: stack-guard uses per-M IsolateData root on M-threads |
+| `deps/v8/src/handles/handles{-inl}.h` | Patched: allows handle creation/usage on goroutine M-threads (bypasses DCHECK) |
+| `deps/v8/src/objects/feedback-vector{-inl}.h` | Patched: IC slot writes (`ComputeHandler`, `SetOptimizedCode`) are skipped on M-threads to prevent shared FV mutation |
+| `deps/v8/src/objects/map.cc` | Patched: map transitions guarded by `v8_goroutine_map_transition_lock()` |
+| `deps/v8/src/objects/js-objects.cc` | Patched: `MigrateToMap` wrapped in `v8_goroutine_shape_seqlock_begin/end()` |
+| `deps/v8/src/objects/shared-function-info.cc` | Patched: tier-up skipped on M-threads (`v8_goroutine_thread` guard) |
+| `deps/v8/src/runtime/runtime-internal.cc` | Patched: allocation lock + real Isolate fixup in `RUNTIME_FUNCTION` handlers on M-threads |
+| `deps/v8/src/api/api{-inl}.h` | Patched: `HandleScope` skips microtask/exception callbacks on goroutine M-threads |
+
+## JavaScript API
+
+Goroutines are accessed via `require('goroutine')`:
+
+```javascript
+const { go, goyield, goid, threadid, goprint } = require('goroutine');
+
+go(fn, ...args);        // Create and schedule a goroutine; returns goroutine ID
+goyield();              // Cooperative yield (explicit scheduling point)
+goid();                 // Get current goroutine ID (0 on main thread)
+threadid();             // Get OS thread ID (Linux gettid) of the M-thread executing this goroutine
+goprint(...args);       // Goroutine-safe print (enqueues output to main thread; use instead of console.log)
+```
+
+**Usage constraints:**
+- `console.log()` / `console.error()` / libuv I/O calls are **NOT** safe from goroutines (libuv is not thread-safe)
+- Use `goprint()` for output from goroutines
+- Only pure JS computation is safe inside goroutines
+- Runtime lazy-inits on first `go()` call; worker threads determined by `GOMAXPROCS` env var
+
+**Test examples:** `test_go.js`, `test_context_switch.js`, `test_thread_ids.js`, `test_memory.js` in project root demonstrate usage patterns.
 
 ## Agent Behaviour Rules
 
@@ -73,7 +112,8 @@ cd /home/pervozdanniy/code/gode && ...
 - **Shared LAB (no sync)**: `ReplaceOldSpaceLAB()` at M-thread init makes LocalHeap's `old_space_allocator_` point at per-M `IsolateData::old_allocation_info_`. Ignition fast path (r13) and LocalHeap share the **same** `LinearAllocationArea` — no manual LAB sync needed. `LabSyncBeforeRun` only syncs `roots_table_` and `marking_flags` after GC (rare). `LabSyncAfterRun` is a no-op.
 - **roots_table_ is a copy**: per-M IsolateData contains a **copy** of main roots_table (~4KB). GC updates only the main copy → must `memcpy` after every safepoint. This is cheap (nanoseconds vs GC milliseconds).
 - **Lock-safepoint deadlock (FIXED)**: any mutex held during V8 allocations must NOT use blocking `mutex.lock()` on goroutine M-threads, because if GC fires the thread is stuck in the kernel and cannot park → GC waits forever. Fix: `v8_goroutine_map_transition_lock()` uses `try_lock()` + `LocalHeap::Safepoint()` spin loop so GC can always proceed. See `goroutine-shape-seqlock.cc`.
-- **Shared FeedbackVectors / no per-M JIT (KI-6)**: goroutines sharing the same JS function share one FeedbackVector → IC pollution → megamorphic slowdown. Fix is Phase 2 (per-M FeedbackVectors + per-M JIT tier-up). Until then, goroutines with heavy allocations are ~5-8x slower than main thread.
+- **Shared FeedbackVectors / no per-M JIT (KI-6)**: goroutines sharing the same JS function share one FeedbackVector. **Current mitigation**: IC slot writes (`ComputeHandler`, `SetOptimizedCode`) are skipped on M-threads entirely (`feedback-vector{-inl}.h` patches) — prevents IC pollution but goroutines stay at unlearned interpreter state. Phase 2 groundwork exists (`goroutine-feedback.{h,cc}`: per-M FV via PersistentHandles) but `.cc` is empty and not yet wired in. Until Phase 2 lands, goroutines with heavy polymorphic allocations are slower than the main thread.
+- **`v8_goroutine_real_isolate` TLS**: `CEntryStub` computes `Isolate*` as `r13 - kRootRegisterBias`, which resolves to per-M IsolateData (not the real Isolate). `v8_goroutine_real_isolate` holds the correct value. Set in `goroutine-thread.cc`, consumed by the `RUNTIME_FUNCTION` macro in `arguments.h` and in `string-table.cc`. Always set this alongside `v8_goroutine_thread` when activating an M-thread.
 
 ## ASAN Build
 

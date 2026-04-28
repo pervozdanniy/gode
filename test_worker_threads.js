@@ -19,7 +19,7 @@ function waitAll(counter) {
     const done = Atomics.load(counter, 0);
     if (done < N) {
         console.log('Curr', done);
-        setTimeout(waitAll, 50, counter);
+        setTimeout(waitAll, 100, counter);
     } else {
         const took = performance.now() - start;
         console.log(`All ${done} goroutines done OK in ${took.toFixed(0)} ms`);

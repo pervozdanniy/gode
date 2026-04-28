@@ -425,6 +425,7 @@ enum class IsolateFieldId : uint8_t;
   V(write_barrier_shared_marking_from_code_function,                           \
     "WriteBarrier::SharedMarkingFromCode")                                     \
   V(shared_barrier_from_code_function, "WriteBarrier::SharedFromCode")         \
+  V(goroutine_resolve_feedback_function, "v8_goroutine_resolve_feedback")     \
   V(call_enqueue_microtask_function, "MicrotaskQueue::CallEnqueueMicrotask")   \
   V(call_enter_context_function, "call_enter_context_function")                \
   V(int64_mul_high_function, "int64_mul_high_function")                        \

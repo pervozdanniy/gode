@@ -39,6 +39,11 @@
 #include "src/wasm/wasm-objects.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
 
+// GOROUTINE: Per-M FeedbackVector resolver (goroutine-feedback.cc).
+// Returns per-M FV clone on M-threads, or fv_raw unchanged on main thread.
+extern "C" uintptr_t v8_goroutine_resolve_feedback(uintptr_t closure_raw,
+                                                    uintptr_t fv_raw);
+
 namespace v8 {
 namespace internal {
 
@@ -1187,6 +1192,28 @@ void Builtins::Generate_InterpreterEntryTrampoline(
 
   // Push feedback vector.
   __ Push(feedback_vector);
+
+  // GOROUTINE: Resolve per-M FeedbackVector on M-threads only.
+  // MAIN THREAD FAST PATH: cmpb + jmp (2 cycles) → skip C-call entirely.
+  Label skip_feedback_resolve;
+  {
+    __ cmpb(Operand(kRootRegister, IsolateData::tables_alignment_padding_offset()),
+            Immediate(0));
+    __ j(equal, &skip_feedback_resolve, Label::kNear);
+
+    // M-thread path: call minimal C function.
+    __ pushq(kRootRegister);  // Save r13
+    __ movq(rdi, Operand(rbp, StandardFrameConstants::kFunctionOffset));
+    __ movq(rsi, Operand(rsp, kSystemPointerSize));  // FV
+    __ PrepareCallCFunction(2);
+    __ CallCFunction(
+        ExternalReference::Create(
+            reinterpret_cast<Address>(&v8_goroutine_resolve_feedback)),
+        2);
+    __ popq(kRootRegister);  // Restore r13
+    __ movq(Operand(rsp, 0), rax);  // Update FV on stack
+  }
+  __ bind(&skip_feedback_resolve);
 
   // Allocate the local and temporary register file on the stack.
   Label stack_overflow;

@@ -123,6 +123,9 @@ struct JSBuiltinDispatchHandleRoot {
   V(ExecutionMode, kUInt8Size, execution_mode)                                 \
   V(StackIsIterable, kUInt8Size, stack_is_iterable)                            \
   V(ErrorMessageParam, kUInt8Size, error_message_param)                        \
+  /* GOROUTINE: tables_alignment_padding_[0] is repurposed as                  \
+     is_goroutine_thread flag (0=main, 1=M-thread). Checked in                 \
+     InterpreterEntryTrampoline via r13+offset for fast path. */               \
   V(TablesAlignmentPadding, 1, tables_alignment_padding)                       \
   V(RegExpStaticResultOffsetsVector, kSystemPointerSize,                       \
     regexp_static_result_offsets_vector)                                       \
@@ -435,9 +438,12 @@ class IsolateData final {
   // case of an error.
   uint8_t error_message_param_;
 
+  // GOROUTINE: Padding byte repurposed as is_goroutine_thread flag.
+  // [0] = 0 for main thread, 1 for M-threads (set in ActivatePState).
+  // Checked in InterpreterEntryTrampoline via [r13 + offset] for fast path.
   // Ensure the following tables are kSystemPointerSize-byte aligned.
   static_assert(FIELD_SIZE(kTablesAlignmentPaddingOffset) > 0);
-  uint8_t tables_alignment_padding_[FIELD_SIZE(kTablesAlignmentPaddingOffset)];
+  uint8_t tables_alignment_padding_[FIELD_SIZE(kTablesAlignmentPaddingOffset)] = {0};
 
   // A pointer to the static offsets vector (used to pass results from the
   // irregexp engine to the rest of V8), or nullptr if the static offsets

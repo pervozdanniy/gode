@@ -16,7 +16,7 @@
 #ifndef V8_EXECUTION_GOROUTINE_GC_ROOTS_H_
 #define V8_EXECUTION_GOROUTINE_GC_ROOTS_H_
 
-#include <mutex>
+#include <atomic>
 #include <vector>
 
 #include "src/handles/handles.h"  // HandleScopeData
@@ -34,44 +34,23 @@ class HandleScopeImplementer;
 namespace v8 {
 namespace internal {
 
+// Maximum number of M-threads (goroutine workers). Indexed by M::id().
+static constexpr int kMaxGoroutineM = 256;
+
 // Per-goroutine GC scanning state.
 // Allocated when goroutine is created, freed when it dies.
 // Populated at yield (Park), cleared at resume (Unpark).
 struct GoroutineGCState {
-  // Full ThreadLocalTop snapshot taken at yield time.
-  // Contains c_entry_fp_, context_, exception_, try_catch_handler_, etc.
-  // nullptr-equivalent (zeroed) when goroutine is running.
+  // ...existing fields unchanged...
   ThreadLocalTop* saved_tlt = nullptr;
-
-  // Pointer to the LIVE per-M IsolateData's TLT (not a copy).
-  // Set in Park, used in Unpark to write GC-updated fields back.
-  // After GC moves objects, saved_tlt has updated pointers; we must copy them
-  // back to live_tlt so the running goroutine sees the correct addresses.
   ThreadLocalTop* live_tlt = nullptr;
-
-  // Per-M HandleScopeImplementer snapshot for GC.
-  // Each goroutine M-thread has its own HSI (not visible to GC via the main
-  // isolate->handle_scope_implementer() path which returns the MAIN HSI).
-  // Handles created inside V8 runtime functions (e.g. Runtime_StoreIC_Miss)
-  // live in the per-M HSI and MUST be visited by GC or they go stale after
-  // object evacuation → stale Handle → crash (GetRootForNonJSReceiver).
-  // Set to the active M's HSI in Park(), cleared to nullptr in Unpark().
   HandleScopeImplementer* hsi = nullptr;
-
-  // Snapshot of the per-M HandleScopeData taken at Park() time.
-  // hsi->Iterate(visitor) internally calls isolate_->handle_scope_data() which,
-  // from the main GC thread, returns the MAIN thread's HSD — wrong limit for
-  // the per-M HSI's current block. We save the per-M HSD here so IterateRoots()
-  // can temporarily swap it into the isolate before calling hsi->Iterate(),
-  // ensuring the correct block limit is used when scanning per-M handles.
   HandleScopeData saved_hsd = {};
-
-  // True when this goroutine is yielded and registered for GC scanning.
   bool yielded = false;
 };
 
 // Global registry of yielded goroutines for GC root scanning.
-// Thread-safe: protected by mutex_.
+// Lock-free: uses a fixed array of atomic pointers indexed by M-thread id.
 class GoroutineGCRegistry {
  public:
   static GoroutineGCRegistry& Get();
@@ -84,6 +63,7 @@ class GoroutineGCRegistry {
 
   // Park: snapshot current ThreadLocalTop and register goroutine for GC.
   // Called from YieldG() before jump_fcontext.
+  // Uses tls_m_id to index into atomic array — no mutex.
   void Park(GoroutineGCState* state, Isolate* isolate);
 
   // Unpark: unregister goroutine from GC scanning.
@@ -91,17 +71,15 @@ class GoroutineGCRegistry {
   void Unpark(GoroutineGCState* state);
 
   // Called from Heap::IterateRoots during GC.
-  // For each yielded goroutine:
-  //   1. Visits tagged roots in saved TLT (exception, context, etc.)
-  //   2. Uses StackFrameIterator to walk mmap stack frames and visit/update
-  //      all V8 object references in the interpreter register files.
   void IterateRoots(Isolate* isolate, RootVisitor* visitor);
 
  private:
-  GoroutineGCRegistry() = default;
+  GoroutineGCRegistry();
 
-  std::mutex mutex_;
-  std::vector<GoroutineGCState*> yielded_;
+  // Fixed array indexed by M-thread id (0..kMaxGoroutineM-1).
+  // Each slot holds a GoroutineGCState* when that M's goroutine is yielded,
+  // nullptr otherwise. GC iterates all slots under safepoint.
+  std::atomic<GoroutineGCState*> per_m_state_[kMaxGoroutineM];
 };
 
 }  // namespace internal
@@ -120,8 +98,11 @@ extern "C" {
   void v8_goroutine_gc_unpark(void* state);
 
   // Set/clear TLS pointer to current goroutine's GC state.
-  // Call before jump_fcontext (with gc_state) and after return to g0 (nullptr).
   void v8_goroutine_set_current_gc_state(void* state);
+
+  // Set the M-thread id for this thread (called once from ThreadLoop).
+  // Used by Park/Unpark to index into per_m_state_[].
+  void v8_goroutine_gc_set_m_id(uint32_t id);
 }
 
 #endif  // V8_EXECUTION_GOROUTINE_GC_ROOTS_H_

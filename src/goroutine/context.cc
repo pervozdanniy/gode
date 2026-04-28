@@ -44,8 +44,21 @@ extern "C" void v8_goroutine_set_current_gc_state(void* state);
 extern "C" void v8_goroutine_shape_seqlock_wait();
 // Returns per-M IsolateData* — used to set kRootRegister (r13) on goroutine entry.
 extern "C" void* v8_goroutine_get_isolate_data();
-// Set per-M StackGuard stack limit directly (does NOT touch shared stack_size_).
-extern "C" void v8_goroutine_set_stack_limit(uintptr_t limit);
+
+// Combined RunG ceremony (goroutine-thread-state.cc).
+// Replaces 5+ individual extern C calls with 2 grouped calls.
+extern "C" void* v8_goroutine_run_enter(v8::Isolate* isolate,
+                                         void* g0_hsd_buf,
+                                         const void* g_hsd_buf,
+                                         bool has_saved_hsd,
+                                         uintptr_t g_stack_bottom,
+                                         void* gc_state);
+extern "C" void v8_goroutine_run_exit(v8::Isolate* isolate,
+                                       void* sg_ptr,
+                                       const void* g0_hsd_buf,
+                                       void* g_hsd_buf,
+                                       bool g_is_dead,
+                                       uintptr_t sp);
 
 namespace node {
 namespace goroutine {
@@ -100,24 +113,15 @@ void* InitContext(G* g, void* stack_top) {
 
 void RunG(G* g, v8::Isolate* isolate) {
 
-  // ---- Save g0's V8 HandleScopeData ----
+  // ---- Enter: save g0 HSD, restore G HSD, set stack limit, set GC state ----
   char g0_hsd[64];
-  v8_goroutine_save_hsd(isolate, g0_hsd);
-
-  // Restore G's saved HSD (resuming), or force a fresh handle block (new G).
-  if (g->has_saved_hsd()) {
-    v8_goroutine_restore_hsd(isolate, g->saved_hsd_buf());
-  } else {
-    v8_goroutine_force_new_handle_block(isolate);
-  }
-
-  // Set stack limit for the goroutine's small mmap stack via per-M StackGuard.
   uintptr_t g_stack_bottom = reinterpret_cast<uintptr_t>(g->stack()->top());
-  v8_goroutine_set_stack_limit(g_stack_bottom + 8192);
-
+  void* sg = v8_goroutine_run_enter(isolate, g0_hsd,
+                                     g->saved_hsd_buf(),
+                                     g->has_saved_hsd(),
+                                     g_stack_bottom,
+                                     g->gc_state());
   tls_current_g = g;
-  v8_goroutine_set_current_gc_state(g->gc_state());
-
 
 #if GOROUTINE_ASAN
   // Tell ASAN we're switching FROM the scheduler (pthread) stack
@@ -137,25 +141,19 @@ void RunG(G* g, v8::Isolate* isolate) {
   __sanitizer_finish_switch_fiber(tls_asan_fake_stack, nullptr, nullptr);
 #endif
 
-
-  // Back on g0 stack — goroutine is no longer running on this M-thread.
-  v8_goroutine_set_current_gc_state(nullptr);
-
   // Back on g0 stack.
   G* returned_g = static_cast<G*>(result.data);
   returned_g->SaveContext(result.fctx);
+  bool is_dead = (returned_g->state() == GState::Gdead);
 
-
-  // ---- Save G's HSD, restore g0's ----
-  v8_goroutine_save_hsd(isolate, returned_g->saved_hsd_buf());
-  returned_g->mark_saved_hsd();
-  v8_goroutine_restore_hsd(isolate, g0_hsd);
+  // ---- Exit: save G HSD (if alive), restore g0 HSD, restore stack limit ----
+  uintptr_t sp = reinterpret_cast<uintptr_t>(&result);
+  v8_goroutine_run_exit(isolate, sg, g0_hsd,
+                         returned_g->saved_hsd_buf(),
+                         is_dead, sp);
+  if (!is_dead) returned_g->mark_saved_hsd();
 
   tls_current_g = nullptr;
-
-  // Restore stack limit to M-thread's OS stack via per-M StackGuard.
-  uintptr_t sp = reinterpret_cast<uintptr_t>(&result);
-  v8_goroutine_set_stack_limit(sp - (900 * 1024));
 }
 
 void YieldG() {

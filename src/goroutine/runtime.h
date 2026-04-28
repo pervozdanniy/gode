@@ -30,6 +30,10 @@ class M {
 
   G* current_g() const { return current_g_; }
 
+  // Flush any accumulated dead goroutines to the global queue.
+  // Called during shutdown to avoid leaking goroutines in local batch.
+  void FlushDeadBatch();
+
   // V8 per-M state lifecycle (per-M IsolateData copy for handles/LABs).
   void InitV8State(v8::Isolate* isolate);
   void DestroyV8State();
@@ -54,6 +58,12 @@ class M {
   Runtime* runtime_ = nullptr;
   uv_thread_t thread_;
   std::atomic<bool> running_{false};
+
+  // Local dead goroutine batch: accumulate up to kDeadBatchSize dead G* here
+  // before flushing to the global dead_queue_. Reduces mutex contention and
+  // async overhead by batching cleanup operations.
+  static constexpr uint32_t kDeadBatchSize = 16;
+  std::vector<G*> dead_batch_;
 
   static void ThreadEntry(void* arg);
   void ThreadLoop();

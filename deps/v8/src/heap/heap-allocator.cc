@@ -14,11 +14,6 @@
 #include "src/heap/local-heap-inl.h"
 #include "src/logging/counters.h"
 
-// LAB sync helpers from goroutine-thread-state.cc (extern "C").
-// Must be called with goroutine LAB in sync before/after LocalHeap operations.
-extern "C" void v8_goroutine_lab_sync_after_run();   // flush per-M top → LH
-extern "C" void v8_goroutine_lab_sync_before_run();  // steal LH LAB → per-M
-
 namespace v8 {
 namespace internal {
 
@@ -156,9 +151,6 @@ void HeapAllocator::CollectGarbage(AllocationType allocation) {
   }
 }
 
-extern "C" void v8_goroutine_alloc_lock();
-extern "C" void v8_goroutine_alloc_unlock();
-
 AllocationResult HeapAllocator::AllocateRawWithRetryOrFailSlowPath(
     int size, AllocationType allocation, AllocationOrigin origin,
     AllocationAlignment alignment) {
@@ -181,9 +173,7 @@ AllocationResult HeapAllocator::AllocateRawWithRetryOrFailSlowPath(
                                    : allocation;
       if (lh_type == AllocationType::kOld ||
           lh_type == AllocationType::kTrusted) {
-        v8_goroutine_lab_sync_after_run();
         Address addr = lh->AllocateRawOrFail(size, lh_type, origin, alignment);
-        v8_goroutine_lab_sync_before_run();
         return AllocationResult::FromObject(HeapObject::FromAddress(addr));
       }
     }
