@@ -22,7 +22,10 @@ constexpr uint32_t kRunqSize = 256;
 
 // Per-thread local queue (owned by Scheduler, indexed by thread id).
 // No P abstraction — queues belong directly to M threads.
-struct LocalQueue {
+//
+// Cache-line aligned to avoid false sharing between worker threads.
+// Each LocalQueue sits on its own 64-byte cache line.
+struct alignas(64) LocalQueue {
   std::atomic<uint32_t> head{0};
   std::atomic<uint32_t> tail{0};
   G* runq[kRunqSize];

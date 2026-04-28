@@ -34,9 +34,16 @@ class GoroutineFeedbackState {
   // Get or create a per-M FeedbackVector for the given JSFunction.
   //   closure_raw      — raw tagged pointer to JSFunction
   //   canonical_fv_raw — raw tagged pointer to the shared canonical FeedbackVector
-  // Returns raw tagged pointer to per-M FV, or canonical_fv_raw on failure.
+  // Returns raw tagged pointer to per-M FV, or canonical_fv_raw on cache miss.
   // Called from InterpreterEntryTrampoline via C stub on goroutine M-threads.
+  // This is a fast lookup-only path — no heavy allocations.
   uintptr_t GetOrCreate(uintptr_t closure_raw, uintptr_t canonical_fv_raw);
+
+  // Heavy allocation path: create a new per-M FeedbackVector and cache it.
+  // Called from G::Execute (C++ context) before invoking JS on this M-thread.
+  // This is NOT called from builtin asm — safe for FeedbackVector::New.
+  // TODO(goroutine): Phase 2 — implement actual FV cloning via FeedbackVector::New.
+  void CreatePerMFeedbackVector(uintptr_t closure_raw, uintptr_t canonical_fv_raw);
 
  private:
   // O(1) lookup: unique_id → PersistentHandle location (GC auto-updates)

@@ -39,7 +39,7 @@ if (isMainThread) {
     const counter = new Int32Array(workerData);
     for (let i = 0; i < N / PROCS; i++) {
         // const obj = {}
-        // const arr = [];
+        const arr = [];
         // const instance = new User();
         let sum = 0;
         for (let j = 0; j < 1_000_000; j++) {

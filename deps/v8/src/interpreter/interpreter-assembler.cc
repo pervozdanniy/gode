@@ -1065,18 +1065,43 @@ InterpreterAssembler::CallRuntimeN(TNode<Uint32T> function_id,
 
 TNode<Int32T> InterpreterAssembler::UpdateInterruptBudget(
     TNode<Int32T> weight) {
-  TNode<JSFunction> function = LoadFunctionClosure();
-  TNode<FeedbackCell> feedback_cell =
-      LoadObjectField<FeedbackCell>(function, JSFunction::kFeedbackCellOffset);
-  TNode<Int32T> old_budget = LoadObjectField<Int32T>(
-      feedback_cell, FeedbackCell::kInterruptBudgetOffset);
+  // GOROUTINE: On M-threads, skip the shared FeedbackCell budget update.
+  // The interrupt_budget field lives in a shared heap object (FeedbackCell).
+  // With N M-threads all decrementing the same cache line on every JumpLoop,
+  // this causes catastrophic MESI cache-line bouncing (40M invalidations for
+  // 4 threads × 10M iterations). On M-threads we return a large positive
+  // value so the budget-check branch is never taken.
+  Label main_thread_path(this), goroutine_path(this), done(this);
+  // Default to large positive value (goroutine fast path — no interrupt).
+  TVARIABLE(Int32T, result, Int32Constant(INT32_MAX / 2));
 
-  // Update budget by |weight| and check if it reaches zero.
-  TNode<Int32T> new_budget = Int32Sub(old_budget, weight);
-  // Update budget.
-  StoreObjectFieldNoWriteBarrier(
-      feedback_cell, FeedbackCell::kInterruptBudgetOffset, new_budget);
-  return new_budget;
+  // Check goroutine flag: [r13 + tables_alignment_padding_offset] == 0 → main.
+  TNode<Uint8T> goroutine_flag = LoadUint8FromRootRegister(
+      IntPtrConstant(IsolateData::tables_alignment_padding_offset()));
+  Branch(Word32Equal(goroutine_flag, Uint32Constant(0)),
+         &main_thread_path, &goroutine_path);
+
+  BIND(&goroutine_path);
+  // M-thread: skip FeedbackCell access entirely. result already INT32_MAX/2.
+  Goto(&done);
+
+  BIND(&main_thread_path);
+  {
+    // Main thread: normal budget decrement on shared FeedbackCell.
+    TNode<JSFunction> function = LoadFunctionClosure();
+    TNode<FeedbackCell> feedback_cell =
+        LoadObjectField<FeedbackCell>(function, JSFunction::kFeedbackCellOffset);
+    TNode<Int32T> old_budget = LoadObjectField<Int32T>(
+        feedback_cell, FeedbackCell::kInterruptBudgetOffset);
+    TNode<Int32T> new_budget = Int32Sub(old_budget, weight);
+    StoreObjectFieldNoWriteBarrier(
+        feedback_cell, FeedbackCell::kInterruptBudgetOffset, new_budget);
+    result = new_budget;
+    Goto(&done);
+  }
+
+  BIND(&done);
+  return result.value();
 }
 
 void InterpreterAssembler::DecreaseInterruptBudget(

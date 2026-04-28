@@ -23,6 +23,10 @@
 #include "src/heap/local-heap.h"
 #include "src/heap/local-heap-inl.h"
 
+// Per-M FeedbackVector creation (goroutine-feedback.cc).
+extern "C" void v8_goroutine_create_per_m_feedback(uintptr_t closure_raw,
+                                                    uintptr_t fv_raw);
+
 
 #include "src/objects/free-space-inl.h"
 
@@ -386,6 +390,13 @@ Tagged<Object> BytecodeBudgetInterruptWithStackCheck(Isolate* isolate,
     Isolate* real = Isolate::Current();
     DirectHandle<JSFunction> fn = args.at<JSFunction>(0);
     fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
+
+    // Phase 2: create per-M FeedbackVector for this function.
+    if (fn->has_feedback_vector()) {
+      Tagged<FeedbackVector> fv = fn->feedback_vector();
+      v8_goroutine_create_per_m_feedback(fn->ptr(), fv.ptr());
+    }
+
     return ReadOnlyRoots(real).undefined_value();
   }
 
@@ -419,6 +430,13 @@ Tagged<Object> BytecodeBudgetInterrupt(Isolate* isolate, RuntimeArguments& args,
     Isolate* real = Isolate::Current();
     DirectHandle<JSFunction> fn = args.at<JSFunction>(0);
     fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
+
+    // Phase 2: create per-M FeedbackVector for this function.
+    if (fn->has_feedback_vector()) {
+      Tagged<FeedbackVector> fv = fn->feedback_vector();
+      v8_goroutine_create_per_m_feedback(fn->ptr(), fv.ptr());
+    }
+
     return ReadOnlyRoots(real).undefined_value();
   }
 

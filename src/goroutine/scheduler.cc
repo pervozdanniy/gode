@@ -112,66 +112,76 @@ void Scheduler::Schedule(G* g) {
 
   g->SetState(GState::Grunnable);
 
-  // Try to push directly to a local queue (round-robin across M-threads).
-  // This avoids global queue contention and allows M-threads to pop O(1)
-  // from their own local queue without any mutex.
+  // Fast path: try one target queue via atomic round-robin.
+  // Avoid iterating all N queues (O(n) cost + false sharing).
   if (num_threads_ > 0) {
-    // Round-robin: cycle through all threads, try each once
-    uint32_t start = dispatch_tid_.fetch_add(1, std::memory_order_relaxed) % num_threads_;
-    for (uint32_t i = 0; i < num_threads_; i++) {
-      uint32_t tid = (start + i) % num_threads_;
-      if (local_queues_[tid]->Push(g)) {
-        return;
-      }
+    uint32_t target = dispatch_tid_.fetch_add(1, std::memory_order_relaxed) % num_threads_;
+    if (local_queues_[target]->Push(g)) {
+      return;
+    }
+    // Target full: try ONE more (next in round-robin).
+    target = (target + 1) % num_threads_;
+    if (local_queues_[target]->Push(g)) {
+      return;
     }
   }
 
-  // All local queues full → fall back to global queue
+  // Both attempts failed → fall back to global queue.
+  // Work stealing will redistribute from global later.
   PushGlobal(g);
 }
 
 G* Scheduler::FindRunnable(uint32_t tid) {
   if (tid >= local_queues_.size()) return nullptr;
   LocalQueue* lq = local_queues_[tid];
-
-  // 1. Every 61st tick → check global first (prevents starvation)
   uint32_t tick = schedtick_[tid]++;
+
+  // 1. Every 61st tick — check global queue FIRST (prevents starvation).
+  // This matches Go's algorithm: global every 61 calls, then local, then steal.
   if (tick % 61 == 0) {
-    G* g = PopGlobal();
-    if (g) return g;
+    if (StealFromGlobal(tid, 10)) {
+      G* g = lq->Pop();
+      if (g) return g;
+    }
   }
 
-  // 2. Own local queue
+  // 2. Own local queue (no mutex, FIFO for our ring buffer).
   G* g = lq->Pop();
   if (g) return g;
 
-  // 3. Global queue
-  if (StealFromGlobal(tid, 10)) {
-    g = lq->Pop();
-    if (g) return g;
+  // 3. Global queue batch steal (if not just checked in step 1).
+  if (tick % 61 != 0) {
+    if (StealFromGlobal(tid, 10)) {
+      g = lq->Pop();
+      if (g) return g;
+    }
   }
 
-  // 4. Work stealing — steal half from a random thread
+  // 4. Work stealing — try to steal from ALL other threads in round-robin.
+  // Go's algorithm: try every P once, starting from last steal victim.
+  // We use a simpler approach: try all threads once in order.
   if (local_queues_.size() > 1) {
-    static thread_local std::random_device rd;
-    static thread_local std::mt19937 gen(rd());
-    std::uniform_int_distribution<uint32_t> dis(0, local_queues_.size() - 1);
-
-    for (uint32_t i = 0; i < local_queues_.size(); i++) {
-      uint32_t victim = dis(gen);
-      if (victim == tid) continue;
+    // Start from (tid+1) to avoid checking self first.
+    for (uint32_t i = 1; i < local_queues_.size(); i++) {
+      uint32_t victim = (tid + i) % local_queues_.size();
 
       std::vector<G*> stolen;
       local_queues_[victim]->StealHalf(stolen);
 
       if (!stolen.empty()) {
-        // Put all but first into our local queue
+        // Put all but first into our local queue.
         for (size_t j = 1; j < stolen.size(); j++) {
           lq->Push(stolen[j]);
         }
         return stolen[0];
       }
     }
+  }
+
+  // 5. Final global check after failed steal (Go does this too).
+  if (StealFromGlobal(tid, 10)) {
+    g = lq->Pop();
+    if (g) return g;
   }
 
   return nullptr;
