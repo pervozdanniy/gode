@@ -28,7 +28,7 @@ function worker() {
     let sum = 0;
     for (let j = 0; j < 1_000_000; j++) {
         sum += j * 10;
-        // const len = arr.push(sum);
+        const len = arr.push(sum);
         // obj[`prop_${j}`] = sum
         // obj['prop'] = sum
         // obj.curr = arr[len - 1];

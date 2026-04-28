@@ -7,6 +7,7 @@
 #include <optional>
 
 #include "src/base/logging.h"
+#include "src/execution/goroutine-flag.h"
 #include "src/common/globals.h"
 #include "src/execution/vm-state-inl.h"
 #include "src/execution/vm-state.h"
@@ -647,7 +648,8 @@ bool PagedSpaceAllocatorPolicy::EnsureAllocation(int size_in_bytes,
     // allocation function to mark the object black when incremental marking is
     // running.
     space_heap()->StartIncrementalMarkingIfAllocationLimitIsReached(
-        allocator_->local_heap(), space_heap()->GCFlagsForIncrementalMarking(),
+        allocator_->local_heap(),
+        space_heap()->GCFlagsForIncrementalMarking(),
         kGCCallbackScheduleIdleGarbageCollection);
   }
 

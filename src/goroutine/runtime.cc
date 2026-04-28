@@ -251,10 +251,7 @@ void Runtime::Init(uint32_t num_threads, uv_loop_t* loop,
   uv_unref(reinterpret_cast<uv_handle_t*>(&async_handle_));
   async_init_ = true;
 
-  // Initialise the GC trigger with a sensible default (64 MB) so the first
-  // OnAsync call never fires LowMemoryNotification unconditionally.
-  // The trigger is recalculated after every GC based on actual live heap size.
-  gc_trigger_heap_.store(64 * 1024 * 1024, std::memory_order_relaxed);
+  // GC is handled by V8's built-in heuristics — no manual trigger needed.
 
   // GOMAXPROCS = number of ADDITIONAL worker M-threads.
   // Main thread (M0) NEVER executes goroutines — always uses worker threads.
@@ -336,32 +333,10 @@ void Runtime::OnAsync(uv_async_t* handle) {
   }
   for (G* g : dead) delete g;
 
-  // Go-style adaptive GC: trigger when heap has grown by kGCGrowthFactor
-  // since the last GC, then update the trigger for the next cycle.
-  // This mirrors Go's nextGC = live_after_gc * (1 + GOGC/100):
-  //   - heavy allocators → trigger fires sooner (heap grows fast)
-  //   - light workloads  → trigger fires rarely (heap stays small)
-  if (!dead.empty()) {
-    v8::HeapStatistics hs;
-    rt->isolate_->GetHeapStatistics(&hs);
-    size_t used = hs.used_heap_size();
-    size_t trigger = rt->gc_trigger_heap_.load(std::memory_order_relaxed);
-    if (used >= trigger) {
-      // MemoryPressureNotification(kModerate) starts incremental marking —
-      // safe to call while goroutine workers are running JS (no STW required).
-      // LowMemoryNotification() is intentionally NOT used here: it calls
-      // CollectAllAvailableGarbage (multiple synchronous full GCs) which can
-      // trigger OOM exceptions in running goroutines and crash UnwindAndFindHandler
-      // on fiber stacks.
-      rt->isolate_->MemoryPressureNotification(v8::MemoryPressureLevel::kModerate);
-      // Recalculate trigger after notifying based on current live heap size.
-      rt->isolate_->GetHeapStatistics(&hs);
-      size_t live = hs.used_heap_size();
-      rt->gc_trigger_heap_.store(
-          static_cast<size_t>(live * kGCGrowthFactor),
-          std::memory_order_relaxed);
-    }
-  }
+  // GC is handled by V8's own heuristics (allocation failure → Mark-Compact).
+  // Previously we called MemoryPressureNotification(kModerate) here which
+  // started extra incremental marking cycles, causing ~90 Mark-Compact GCs
+  // instead of V8's natural ~4 for the same workload.  Removed.
 
   // Drain the goroutine print queue on the main thread.
   std::vector<std::string> local;

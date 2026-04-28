@@ -292,18 +292,17 @@ Handle<Code> Factory::CodeBuilder::Build() {
 
 Tagged<HeapObject> Factory::AllocateRaw(int size, AllocationType allocation,
                                         AllocationAlignment alignment) {
-  // GOROUTINE PATCH: on M-threads, bypass main thread's HeapAllocator to avoid
   // GOROUTINE PATCH: on M-threads route through LocalHeap (avoids races on
   // main thread's LAB and safepoint deadlocks from StartIncrementalMarking).
-  // LAB is shared via ReplaceOldSpaceLAB, roots_table synced after safepoint.
+  // LAB is shared via ReplaceOldSpaceLAB (old + new), roots_table synced after
+  // safepoint.  kYoung goes through per-M new_space_allocator_ (backed by old
+  // space) — no kYoung→kOld redirect needed.
   if (v8_goroutine_thread) {
     LocalHeap* lh = LocalHeap::Current();
     if (V8_LIKELY(lh && !lh->is_main_thread())) {
-      AllocationType lh_type = (allocation == AllocationType::kYoung)
-                                   ? AllocationType::kOld : allocation;
       Tagged<HeapObject> obj =
           lh->AllocateRawWith<HeapAllocator::kRetryOrFail>(
-              size, lh_type, AllocationOrigin::kRuntime, alignment);
+              size, allocation, AllocationOrigin::kRuntime, alignment);
       return obj;
     }
   }
@@ -333,10 +332,8 @@ Tagged<HeapObject> Factory::AllocateRawWithAllocationSite(
   if (v8_goroutine_thread) {
     LocalHeap* lh = LocalHeap::Current();
     if (V8_LIKELY(lh && !lh->is_main_thread())) {
-      AllocationType lh_type = (allocation == AllocationType::kYoung)
-                                   ? AllocationType::kOld : allocation;
       result = lh->AllocateRawWith<HeapAllocator::kRetryOrFail>(
-          allocation_size, lh_type, AllocationOrigin::kRuntime);
+          allocation_size, allocation, AllocationOrigin::kRuntime);
     } else {
       result = allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(
           allocation_size, allocation);
@@ -377,10 +374,8 @@ Tagged<HeapObject> Factory::New(DirectHandle<Map> map,
   if (v8_goroutine_thread) {
     LocalHeap* lh = LocalHeap::Current();
     if (V8_LIKELY(lh && !lh->is_main_thread())) {
-      AllocationType lh_type = (allocation == AllocationType::kYoung)
-                                   ? AllocationType::kOld : allocation;
       result = lh->AllocateRawWith<HeapAllocator::kRetryOrFail>(
-          size, lh_type, AllocationOrigin::kRuntime);
+          size, allocation, AllocationOrigin::kRuntime);
     } else {
       result = allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(
           size, allocation);

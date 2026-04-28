@@ -135,15 +135,6 @@ void GoroutineThreadState::ActivatePState(GoroutinePState* state) {
   // This byte is checked inline in InterpreterEntryTrampoline for fast-path.
   state->isolate_data->tables_alignment_padding_[0] = 1;
 
-  static std::atomic<int> activate_count{0};
-  int count = activate_count.fetch_add(1, std::memory_order_relaxed);
-  if (count < 5) {
-    fprintf(stderr, "[GOROUTINE] ActivatePState #%d, tid=%d, flag_addr=%p, flag_value=%d\n",
-            count, (int)syscall(SYS_gettid),
-            (void*)&state->isolate_data->tables_alignment_padding_[0],
-            (int)state->isolate_data->tables_alignment_padding_[0]);
-  }
-
   g_active_p_state = state;
   v8_goroutine_thread = true;
   tls_per_m_isolate_data = state->isolate_data;

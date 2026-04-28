@@ -498,9 +498,11 @@ RUNTIME_FUNCTION(Runtime_AllocateInYoungGeneration) {
       (void)flags;
       CHECK(IsAligned(size, kTaggedSize));
       CHECK_GT(size, 0);
+      // Allocate as kYoung — per-M new_space_allocator_ (backed by old space)
+      // will handle this and refill new_allocation_info_ LAB for CSA fast-path.
       Tagged<HeapObject> obj =
           lh->AllocateRawWith<HeapAllocator::kRetryOrFail>(
-              size, AllocationType::kOld, AllocationOrigin::kGeneratedCode,
+              size, AllocationType::kYoung, AllocationOrigin::kGeneratedCode,
               kTaggedAligned);
       // Initialize filler map directly — avoid shared-heap CreateFillerObjectAt
       // which touches MemoryChunk counters (data race without GVL).

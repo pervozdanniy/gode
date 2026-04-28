@@ -63,6 +63,10 @@ void HeapAllocator::Setup(LinearAllocationArea* new_allocation_info,
 // GOROUTINE PATCH: Recreate old_space_allocator_ with a custom LAB pointer
 // so that it shares top/limit with per-M IsolateData::old_allocation_info_
 // (accessed by Ignition via r13). Eliminates LabSync overhead.
+// Also creates new_space_allocator_ backed by old space, using per-M
+// IsolateData::new_allocation_info_ (immediately before old_allocation_info_
+// in IsolateData layout). This gives CSA's kYoung fast-path a working
+// bump-pointer on M-threads, avoiding ~980K Runtime calls per goroutine.
 void HeapAllocator::ReplaceOldSpaceLAB(LinearAllocationArea* lab) {
   // Free existing LAB to avoid leaking pages.
   if (old_space_allocator_.has_value()) {
@@ -71,6 +75,15 @@ void HeapAllocator::ReplaceOldSpaceLAB(LinearAllocationArea* lab) {
   }
   old_space_allocator_.emplace(local_heap_, heap_->old_space(),
                                MainAllocator::IsNewGeneration::kNo, lab);
+
+  // new_allocation_info_ is immediately before old_allocation_info_ in
+  // IsolateData (see ISOLATE_DATA_FIELDS macro in isolate-data.h).
+  // Both are LinearAllocationArea structs, so (lab - 1) points to
+  // new_allocation_info_.  Create a separate allocator backed by old space
+  // so CSA kYoung bump-pointer works via [r13 + new_allocation_info_offset].
+  LinearAllocationArea* new_lab = lab - 1;
+  new_space_allocator_.emplace(local_heap_, heap_->old_space(),
+                               MainAllocator::IsNewGeneration::kNo, new_lab);
 }
 
 void HeapAllocator::SetReadOnlySpace(ReadOnlySpace* read_only_space) {
@@ -81,6 +94,11 @@ AllocationResult HeapAllocator::AllocateRawLargeInternal(
     int size_in_bytes, AllocationType allocation, AllocationOrigin origin,
     AllocationAlignment alignment) {
   DCHECK_GT(size_in_bytes, heap_->MaxRegularHeapObjectSize(allocation));
+  // GOROUTINE PATCH: on M-threads, redirect kYoung large objects to old LO
+  // space. NewLargeObjectSpace is not thread-safe and is managed by Scavenger.
+  if (v8_goroutine_thread && allocation == AllocationType::kYoung) {
+    allocation = AllocationType::kOld;
+  }
   switch (allocation) {
     case AllocationType::kYoung:
       return new_lo_space()->AllocateRaw(local_heap_, size_in_bytes);
@@ -168,12 +186,13 @@ AllocationResult HeapAllocator::AllocateRawWithRetryOrFailSlowPath(
   if (v8_goroutine_thread && local_heap_->is_main_thread()) {
     LocalHeap* lh = LocalHeap::Current();
     if (lh && !lh->is_main_thread()) {
-      AllocationType lh_type = (allocation == AllocationType::kYoung)
-                                   ? AllocationType::kOld
-                                   : allocation;
-      if (lh_type == AllocationType::kOld ||
-          lh_type == AllocationType::kTrusted) {
-        Address addr = lh->AllocateRawOrFail(size, lh_type, origin, alignment);
+      // kYoung now goes through per-M new_space_allocator_ (backed by old
+      // space) — no need to redirect to kOld.
+      if (allocation == AllocationType::kYoung ||
+          allocation == AllocationType::kOld ||
+          allocation == AllocationType::kTrusted) {
+        Address addr =
+            lh->AllocateRawOrFail(size, allocation, origin, alignment);
         return AllocationResult::FromObject(HeapObject::FromAddress(addr));
       }
     }
