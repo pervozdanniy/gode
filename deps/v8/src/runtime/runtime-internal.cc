@@ -210,6 +210,7 @@ RUNTIME_FUNCTION(Runtime_ThrowInvalidTypedArrayAlignment) {
 RUNTIME_FUNCTION(Runtime_UnwindAndFindExceptionHandler) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(0, args.length());
+  return isolate->UnwindAndFindHandler();
 }
 
 RUNTIME_FUNCTION(Runtime_PropagateException) {
