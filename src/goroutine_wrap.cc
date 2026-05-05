@@ -6,6 +6,7 @@
 #include "v8.h"
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -14,6 +15,15 @@
 #include "goroutine/scheduler.h"
 #include "goroutine/g.h"
 #include "goroutine/context.h"
+
+// Goroutine TLS flags — defined in deps/v8/src/execution/goroutine-thread.cc
+// v8_goroutine_thread : true while an M-thread is running JS
+// v8_goroutine_real_isolate : the real Isolate* (M-threads have a per-M
+//   IsolateData as their r13 root; this TLS holds the actual Isolate pointer)
+extern thread_local __attribute__((tls_model("initial-exec")))
+    bool v8_goroutine_thread;
+extern thread_local __attribute__((tls_model("initial-exec")))
+    void* v8_goroutine_real_isolate;
 
 #define GWRAP_TRACE(fmt, ...) do {} while(0)
 
@@ -106,22 +116,76 @@ void Threadid(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(Number::New(isolate, static_cast<double>(tid)));
 }
 
-// goprint(...args) — goroutine-safe print.
-// Converts all arguments to strings (like console.log), enqueues the message,
-// and signals the main thread to flush. Safe to call from any goroutine thread.
-// The actual write() happens on the main thread — no libuv races.
-void Goprint(const FunctionCallbackInfo<Value>& args) {
+// writeFdSync(fd, stringOrBuffer) — goroutine-safe direct fd write.
+//
+// Accepts either a JS String or an ArrayBufferView (Buffer/Uint8Array).
+//
+// String path:
+//   Uses String::Utf8Value(real_isolate, str) under a static mutex.
+//   The real Isolate pointer comes from v8_goroutine_real_isolate TLS — needed
+//   because on M-threads args.GetIsolate() returns a per-M IsolateData (fake),
+//   and String::Flatten(fake_isolate) tries to call fake_isolate->factory()
+//   at the wrong struct offset → SIGSEGV / UNREACHABLE.
+//
+// ArrayBufferView path:
+//   Reads raw bytes from the backing store and calls write(2) directly.
+//   No V8 string API needed.
+void WriteFdSync(const FunctionCallbackInfo<Value>& args) {
+  if (args.Length() < 2) return;
+
+  // Fix up Isolate for M-threads: args.GetIsolate() returns per-M IsolateData;
+  // use the real Isolate* stored in v8_goroutine_real_isolate instead.
   Isolate* isolate = args.GetIsolate();
-
-  std::string output;
-  for (int i = 0; i < args.Length(); i++) {
-    if (i > 0) output += ' ';
-    v8::String::Utf8Value str(isolate, args[i]);
-    if (*str) output += *str;
+  if (v8_goroutine_thread && v8_goroutine_real_isolate) {
+    isolate = reinterpret_cast<Isolate*>(v8_goroutine_real_isolate);
   }
-  output += '\n';
 
-  goroutine::Runtime::GetInstance()->EnqueuePrint(std::move(output));
+  int fd = args[0]->Int32Value(isolate->GetCurrentContext()).FromMaybe(1);
+
+  if (args[1]->IsString()) {
+    // String path — mutex serialises String::Flatten + write(2) across
+    // multiple M-threads (also prevents interleaved output on the fd).
+    static std::mutex write_mutex;
+    std::lock_guard<std::mutex> lock(write_mutex);
+
+    String::Utf8Value utf8(isolate, args[1]);
+    if (*utf8 == nullptr || utf8.length() == 0) return;
+
+    const char* buf = *utf8;
+    ssize_t remaining = static_cast<ssize_t>(utf8.length());
+    while (remaining > 0) {
+      ssize_t n = ::write(fd, buf, static_cast<size_t>(remaining));
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        break;
+      }
+      buf += n;
+      remaining -= n;
+    }
+    return;
+  }
+
+  // ArrayBufferView path (Buffer / Uint8Array / etc.)
+  if (!args[1]->IsArrayBufferView()) return;
+  Local<v8::ArrayBufferView> view = args[1].As<v8::ArrayBufferView>();
+  size_t byte_length = view->ByteLength();
+  if (byte_length == 0) return;
+
+  std::shared_ptr<v8::BackingStore> backing = view->Buffer()->GetBackingStore();
+  const char* buf =
+      static_cast<const char*>(backing->Data()) + view->ByteOffset();
+  ssize_t remaining = static_cast<ssize_t>(byte_length);
+
+  // write(2) is thread-safe; retry on EINTR.
+  while (remaining > 0) {
+    ssize_t n = ::write(fd, buf, static_cast<size_t>(remaining));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    buf += n;
+    remaining -= n;
+  }
 }
 
 void Initialize(Local<Object> target,
@@ -132,7 +196,7 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "yield", Yield);
   SetMethod(context, target, "goid", Goid);
   SetMethod(context, target, "threadid", Threadid);
-  SetMethod(context, target, "goprint", Goprint);
+  SetMethod(context, target, "writeFdSync", WriteFdSync);
 }
 
 void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
@@ -140,7 +204,7 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(Yield);
   registry->Register(Goid);
   registry->Register(Threadid);
-  registry->Register(Goprint);
+  registry->Register(WriteFdSync);
 }
 
 }  // namespace goroutine_wrap

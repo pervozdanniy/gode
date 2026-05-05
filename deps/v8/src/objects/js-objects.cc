@@ -4,7 +4,6 @@
 
 #include "src/objects/js-objects.h"
 
-#include "src/execution/goroutine-shape-seqlock.h"
 
 #include <limits>
 #include <optional>
@@ -3428,11 +3427,6 @@ void JSObject::MigrateToMap(Isolate* isolate, DirectHandle<JSObject> object,
   DirectHandle<Map> old_map(object->map(isolate), isolate);
   NotifyMapChange(old_map, new_map, isolate);
 
-  // Phase 1.3: SeqLock — signal goroutine M-threads that a shape transition
-  // is in progress. Any M-thread resuming a goroutine will spin in
-  // v8_goroutine_shape_seqlock_wait() until we call seqlock_end() below,
-  // preventing it from seeing an inconsistent (map, backing store) pair.
-  v8_goroutine_shape_seqlock_begin();
 
   if (old_map->is_dictionary_map()) {
     // For slow-to-fast migrations JSObject::MigrateSlowToFast()
@@ -3464,16 +3458,6 @@ void JSObject::MigrateToMap(Isolate* isolate, DirectHandle<JSObject> object,
   }
 
   // Careful: Don't allocate here!
-  // For some callers of this method, |object| might be in an inconsistent
-  // state now: the new map might have a new elements_kind, but the object's
-  // elements pointer hasn't been updated yet. Callers will fix this, but in
-  // the meantime, (indirectly) calling JSObjectVerify() must be avoided.
-  // When adding code here, add a DisallowGarbageCollection too.
-
-
-  // Phase 1.3: SeqLock end -- transition complete.
-  // M-threads waiting in v8_goroutine_shape_seqlock_wait() are unblocked.
-  v8_goroutine_shape_seqlock_end();
 }
 
 void JSObject::ForceSetPrototype(Isolate* isolate,

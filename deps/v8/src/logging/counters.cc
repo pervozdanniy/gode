@@ -5,6 +5,7 @@
 #include "src/logging/counters.h"
 
 #include "src/base/atomic-utils.h"
+#include "src/execution/goroutine-flag.h"
 #include "src/base/platform/elapsed-timer.h"
 #include "src/base/platform/time.h"
 #include "src/builtins/builtins-definitions.h"
@@ -48,6 +49,11 @@ std::atomic<int>* StatsCounter::SetupPtrFromStatsTable() {
 }
 
 void Histogram::AddSample(int sample) {
+  // GOROUTINE PATCH: skip histogram recording on M-threads.
+  // counters_ (StatsTable callbacks) are not thread-safe; concurrent calls
+  // from goroutine M-threads corrupt shared histogram state → SIGSEGV.
+  // Performance counters are non-critical — safe to skip.
+  if (v8_goroutine_thread) return;
   if (Enabled()) {
     counters_->AddHistogramSample(histogram_, sample);
   }

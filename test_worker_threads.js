@@ -33,19 +33,28 @@ if (isMainThread) {
         new Worker(__filename, {workerData: sab});
     }
 
-
     setTimeout(waitAll, 500, counter);
 } else {
     const counter = new Int32Array(workerData);
     for (let i = 0; i < N / PROCS; i++) {
-        // const obj = {}
+        const map = new Map();
+        console.log('Working...');
+
+        function inner(key, value) {
+            map.set(`prop_${key}`, value);
+        }
+        const obj = {}
         const arr = [];
+        // const arr = new Array(1_000_000);
         // const instance = new User();
         let sum = 0;
         for (let j = 0; j < 1_000_000; j++) {
+
             sum += j * 10;
+            // arr[j] = sum;
             const len = arr.push(sum);
-            // obj['prop'] = sum
+            // obj[`prop_${j}`] = arr[len - 1]
+            // inner(j, sum);
             // obj.curr = arr[len - 1];
         }
         Atomics.add(counter, 0, 1);

@@ -40,8 +40,7 @@ extern "C" void v8_goroutine_gc_park(v8::Isolate* isolate, void* state);
 extern "C" void v8_goroutine_gc_unpark(void* state);
 // Set TLS pointer so local-heap.cc safepoint hooks can find goroutine gc_state.
 extern "C" void v8_goroutine_set_current_gc_state(void* state);
-// Phase 1.3: SeqLock — wait until no shape transition is in flight.
-extern "C" void v8_goroutine_shape_seqlock_wait();
+// Phase 1.3: SeqLock removed — v8_goroutine_shape_seqlock_wait() was dead code.
 // Returns per-M IsolateData* — used to set kRootRegister (r13) on goroutine entry.
 extern "C" void* v8_goroutine_get_isolate_data();
 
@@ -185,7 +184,6 @@ void YieldG() {
     void* iso_data = v8_goroutine_get_isolate_data();
     __asm__ volatile("movq %0, %%r13" : : "r"(iso_data) : "r13");
   }
-  v8_goroutine_shape_seqlock_wait();
   v8_goroutine_gc_unpark(g->gc_state());
   tls_sched_ctx = t.fctx;
 }

@@ -1,6 +1,6 @@
 ## Финальный план реализации
 
-> Последнее обновление: 2026-04-28 (Phase 2 partial: per-M FeedbackVector + UpdateInterruptBudget skip → 3.72x scaling)
+> Последнее обновление: 2026-05-05 (Phase 2 partial: per-M FeedbackVector + UpdateInterruptBudget skip → 3.72x scaling; console.log primitives fixed; SeqLock replaced by mutex DCL; KI-7: object logging broken due to Relocatable race; KI-8: Buffer unsafe from goroutines)
 > Статусы: ✅ DONE | 🔨 IN PROGRESS (собрано, не протестировано) | ❌ KNOWN ISSUE | 📋 TODO
 > Текущая фаза: **Phase 2 (per-M FeedbackVectors — partial, per-M JIT — TODO)**
 
@@ -192,17 +192,143 @@ RUNTIME_FUNCTION_RETURNS_TYPE (arguments.h) исправляет isolate в на
      (безопаснее, не требует V8 изменений)
 ```
 
-### KI-3: libuv I/O не thread-safe из горутин
+### KI-3: console.log и обработка ошибок из горутин ✅ FIXED (частично, см. KI-7)
 
 ```
 Проблема: console.log, fs.*, net.* из worker тредов вызывают libuv
   напрямую → data race, возможный crash.
 
-Текущий workaround: Runtime::EnqueuePrint + print_queue → main thread
-  разгребает в OnAsync.
+Решение для console.log:
+  Console.prototype.log ПОЛНОСТЬЮ обходится на M-тредах (lib/internal/goroutine.js).
+  Причина: Console.prototype.log → kGetInspectOptions → getColorDepth()
+    → /^xterm|.../.test(env.TERM) → IrregexpInterpreter::RawMatch(fake_isolate) → SIGSEGV.
+  Патч: console.log/error/warn/info/debug перехвачены — на M-тредах вызывается
+  _writeFdSync(write(2)) напрямую, минуя всю Console machinery.
+  Строки/числа/булевы значения печатаются корректно.
+  Объекты печатаются как [object Object] — см. KI-7 для деталей.
 
-Полное решение: Фаза 4 (per-M uv_loop) + маршрутизация всех I/O запросов
+  Дополнительно: process.stdout.write / process.stderr.write перехвачены
+  аналогично — для прямых вызовов без console.
+
+  IrregexpInterpreter::RawMatch также пропатчен (regexp-interpreter.cc):
+    if (v8_goroutine_thread) isolate = real_isolate;
+  Это делает regex безопасным в принципе, но util.inspect по-прежнему
+  небезопасен из-за KI-7 (Relocatable race).
+
+Решение для ошибок в горутинах ✅ FIXED:
+  Доступ к e.stack из M-тредов запрещён — .stack accessor вызывает
+  ErrorStackGetter → FormatStackTrace → JS execution (CallSite constructors,
+  Error.prepareStackTrace). На M-тредах это приводит к:
+    1. SIGSEGV — ErrorStackGetter использует fake isolate (info.GetIsolate()
+       = per-M IsolateData), вызывает isolate->factory() → crash
+    2. DisallowJavascriptExecutionScope — VisitStack (при captures stack trace)
+       ставит DisallowJavascriptExecution на real Isolate → main thread
+       пытается вызвать JS таймер → видит запрет → V8_Fatal
+    3. DescriptorLookupCache race (уже обойден через SearchWithCache bypass)
+
+  Итоговый фикс: JS catch handler читает только data properties e.name и
+  e.message (не accessors) → ErrorStackGetter вообще не вызывается →
+  FormatStackTrace не запускается → VisitStack не ставит assert flags.
+
+  descriptor-array-inl.h: SearchWithCache() bypass остаётся — защищает
+  от гонок в DescriptorLookupCache при любых property lookups из горутин.
+
+  counters.cc: Histogram::AddSample() guard остаётся.
+
+Файлы:
+  lib/internal/goroutine.js                      — catch reads e.name+e.message only
+  deps/v8/src/objects/descriptor-array-inl.h     — SearchWithCache bypass
+  deps/v8/src/logging/counters.cc                — Histogram::AddSample guard
+  deps/v8/src/regexp/regexp-interpreter.cc       — RawMatch isolate fixup
+
+Полное решение для fs/net I/O: Фаза 4 (per-M uv_loop) + маршрутизация всех I/O
   через main loop (промежуточно) или per-M loops (финально).
+```
+
+### KI-7: console.log не форматирует объекты (печатает [object Object]) ❌ KNOWN ISSUE
+
+```
+Проблема:
+  console.log('x', { a: 1 }) из горутины печатает 'x [object Object]'
+  вместо 'x { a: 1 }'.
+
+Причина:
+  _goroutineConsoleWrite использует String(a) для не-строк.
+  Правильное форматирование требует util.inspect(a), но util.inspect
+  использует внутренние V8 операции (regex, string replace буiltins),
+  которые создают объекты типа Relocatable (CustomArgumentsBase,
+  при вызове string replace с regexp через FlatStringReader-related paths).
+
+  Relocatable::relocatable_top_ — связанный список в реальном Isolate,
+  не диспатченный через tls_per_m_isolate_data. Несколько M-тредов
+  одновременно модифицируют его без синхронизации. GC на main thread
+  читает список (Relocatable::Iterate) → corrupted list → SIGSEGV в
+  RootMarkingVisitor::VisitRootPointers.
+
+  Подтверждено: без console.log 100 горутин x 1M push = нет краша.
+  С util.inspect в _goroutineConsoleWrite — SIGSEGV в GC.
+
+Варианты решения:
+  A) Spinlock на set_relocatable_top() — защищает список без per-M рефакторинга.
+     Файлы: deps/v8/src/objects/objects-inl.h (Relocatable ctor/dtor)
+     Просто, но spinlock на горячем пути.
+
+  B) Per-M Relocatable списки — аналогично thread_local_top(): tls-dispatch.
+     Файлы: isolate.h (добавить relocatable_top в per-M dispatch),
+             объекты.cc (Iterate — обходить все per-M списки при GC)
+     Сложнее, нет overhead в hot path.
+
+  C) Форматирование объектов на main thread (async print queue).
+     Упрощает горутинный код, но output асинхронный (может перемешаться).
+
+  D) JSON.stringify вместо util.inspect — тоже крашится (аналогичная причина,
+     JSON serializer создаёт временные объекты через те же V8 paths).
+
+Текущее состояние: A или B — наиболее реалистичны.
+Рекомендуется B для корректного решения.
+```
+
+### KI-8: Buffer недоступен из горутин ❌ KNOWN ISSUE
+
+```
+Проблема:
+  Buffer.from(), Buffer.allocUnsafe(), Buffer.alloc() — SIGSEGV из горутин.
+
+Два отдельных бага:
+
+  1. Shared pool data race (lib/buffer.js):
+     allocPool, poolOffset, allocBuffer — module-level переменные, общие
+     для всех M-тредов. fromStringFast() читает и пишет poolOffset без атомарности.
+     4 M-треда одновременно: read-modify-write poolOffset → corrupted offset
+     → new FastBuffer(allocPool, garbage_offset, size) → Builtins_CreateTypedArray
+     получает мусорный ArrayBuffer (или rbx=0) → SIGSEGV.
+
+  2. Fake Isolate в Builtins_CreateTypedArray (inline CSA builtin):
+     new Uint8Array(allocPool, offset, size) → Builtins_CreateTypedArray — это
+     Torque-generated binary builtin, использует r13 (per-M IsolateData) для
+     доступа к array_buffer_allocator, ARRAY_BUFFER_MAP_INDEX и т.д.
+     array_buffer_allocator живёт в реальном Isolate, не в per-M IsolateData
+     → читается мусор → crash внутри backing store allocation.
+     RUNTIME_FUNCTION патч не покрывает inline builtins (не C++ runtime функции).
+
+Статус:
+  Не критично для текущих задач (горутины = pure JS computation).
+  Buffer нужен для HTTP/network I/O (Фаза 4-5).
+
+TODO для Fix 1 (pool race):
+  В fromStringFast/fromArrayLike проверить v8_goroutine_thread через C++ binding
+  и всегда вызывать createFromString/createUnsafeBuffer (bypass pool).
+  Но нельзя вызывать internalBinding('goroutine') из buffer.js при bootstrap
+  (snapshot generation — вызов инициализирует binding → snapshot падает с
+  "Unknown external reference"). Нужен другой механизм детекции M-треда.
+  Вариант: глобальный C++ флаг (TLS, не через JS binding) экспортированный
+  в lib/buffer.js через process binding (не goroutine binding).
+
+TODO для Fix 2 (fake isolate в builtins):
+  Патч AllocateExternalBackingStore / SetAllocatorFromIsolate в backing-store.cc
+  чтобы использовали v8_goroutine_real_isolate для получения array_buffer_allocator.
+  Файл: deps/v8/src/objects/backing-store.cc
+  Аналогично патчу BackingStore::Allocate (уже сделан).
 ```
 
 ### KI-4: GC не может прервать CPU-bound горутину изнутри
@@ -240,6 +366,36 @@ RUNTIME_FUNCTION_RETURNS_TYPE (arguments.h) исправляет isolate в на
   goroutine-thread-state.h/cc  — список активных p_states + SignalAllMThreads
   deps/v8/src/execution/isolate-safepoint.cc  — хук (минимальное изменение)
   deps/v8/src/runtime/runtime-stack-check.cc  — Runtime_StackGuard patch
+```
+
+### KI-9: Goroutine error propagation to caller 📋 TODO
+
+```
+Цель: позволить вызывающей стороне ловить ошибки из горутин.
+
+API:
+  go(worker).catch((err) => {
+    console.log('goroutine failed:', err.name, err.message);
+  });
+  // Без .catch() — текущее поведение (печать в stderr).
+
+Реализация:
+  1. C++ (runtime.h/cc) — потокобезопасная очередь ошибок + uv_async_t:
+     std::mutex + std::vector<{goid, name, message}> — M-поток кладёт ошибку
+     uv_async_send — будит main event loop
+
+  2. C++ (goroutine_wrap.cc) — два новых binding:
+     _reportError(goid, name, message) — M-поток пишет в очередь + uv_async_send
+     _drainErrors() — main thread забирает все ошибки (возвращает массив)
+
+  3. JS (lib/internal/goroutine.js):
+     go() возвращает объект с .catch(fn) вместо числа
+     Map<goid, handler> — реестр обработчиков
+     uv_async callback вызывает _drainErrors(), находит handler по goid, вызывает
+     Если handler не зарегистрирован — пишем в stderr (как сейчас)
+
+Безопасность: M-поток кладёт только строки (name + message) через mutex,
+JS callback вызывается ТОЛЬКО на main thread через uv_async.
 ```
 
 ### KI-5: Data race при небезопасном доступе к общим объектам
@@ -382,7 +538,7 @@ RUNTIME_FUNCTION_RETURNS_TYPE (arguments.h) исправляет isolate в на
 ### 1.1 GC Safepoints ✅ DONE
 ### 1.2 GC roots для mmap-стеков ✅ DONE
 
-### 1.3 SeqLock на shape transitions 📋 TODO
+### 1.3 Map transition mutex ✅ DONE (SeqLock удалён)
 
 **1.1 GC Safepoints для M тредов** ✅ DONE
 
@@ -446,24 +602,65 @@ Deadlock был: unpark вне GVL → Running, ждёт GVL → GC deadlock.
 Больше не актуально — GVL нет.
 ```
 
-**1.3 SeqLock на shape transitions**
+**1.3 Map transition mutex (goroutine-shape-lock)** ✅ DONE
 
 ```
-Файлы: src/objects/heap-object.h, objects.cc
+Было: SeqLock (goroutine-shape-seqlock.{h,cc}) — версионный счётчик в object header,
+  MigrateToMap писал seqlock_begin/end, context.cc ждал seqlock_wait до gc_unpark.
+  Удалено: SeqLock был переусложнён и мешал работе.
 
-Изменения:
-  - version counter (uint32) в object header
-  - При shape transition (только main тред):
-      version++ → write → version++
-  - При чтении map pointer из M треда:
-      читаем version до и после
-      если изменилась → читаем снова
+Стало: mutex-based guard (goroutine-shape-lock.{h,cc})
+  v8_goroutine_map_transition_lock() / unlock()
+  — защищает только СОЗДАНИЕ новых transitions (TransitionToDataProperty),
+    не MigrateToMap, т.к. мутация уже существующего Map атомарна через
+    правильный порядок: SetProperties() → set_map() (store-store fence).
 
-Тест: main тред добавляет свойства → M тред читает → нет UB
-~150 строк
+DCL fast path (Double-Checked Locking) в TransitionToDataProperty:
+  1. Спекулятивно ищем transition без мьютекса (SearchTransition lock-free)
+  2. Если нашли и CanHoldValue → возвращаем немедленно (99%+ случаев)
+  3. Только при cache-miss → берём мьютекс → SearchTransition снова → insert
+
+Spinlock с GC safepoint:
+  try_lock() + LocalHeap::Safepoint() + std::this_thread::yield() на M-тредах
+  Гарантия: GC всегда может сделать StopTheWorld даже пока кто-то ждёт мьютекс.
+
+Файлы:
+  deps/v8/src/execution/goroutine-shape-lock.{h,cc}  — mutex impl
+  deps/v8/src/objects/map.cc                          — DCL fast path
 ```
 
 ---
+
+### KI-9: Goroutine error propagation to caller 📋 TODO
+
+```
+Цель: позволить вызывающей стороне ловить ошибки из горутин.
+
+API:
+  go(worker).catch((err) => {
+    console.log('goroutine failed:', err.name, err.message);
+  });
+  // Без .catch() — текущее поведение (печать в stderr).
+
+Реализация:
+
+  1. C++ (runtime.h/cc) — потокобезопасная очередь ошибок + uv_async_t:
+     - std::mutex + std::vector<{goid, name, message}> — M-поток кладёт ошибку
+     - uv_async_send — будит main event loop
+
+  2. C++ (goroutine_wrap.cc) — два новых binding:
+     - _reportError(goid, name, message) — M-поток пишет в очередь + uv_async_send
+     - _drainErrors() — main thread забирает все ошибки (возвращает массив)
+
+  3. JS (lib/internal/goroutine.js):
+     - go() возвращает объект с .catch(fn) вместо числа
+     - Map<goid, handler> — реестр обработчиков
+     - uv_async callback вызывает _drainErrors(), находит handler по goid, вызывает
+     - Если handler не зарегистрирован — пишем в stderr (как сейчас)
+
+Безопасность: M-поток кладёт только строки (name + message) через mutex,
+JS callback вызывается ТОЛЬКО на main thread через uv_async.
+```
 
 ### Фаза 2: Per-thread JIT cache
 

@@ -8,6 +8,7 @@
 #include <optional>
 
 #include "src/base/bits.h"
+#include "src/execution/goroutine-flag.h"
 #include "src/execution/isolate.h"
 #include "src/handles/global-handles.h"
 #include "src/logging/counters.h"
@@ -201,6 +202,12 @@ BackingStore::~BackingStore() {
 std::unique_ptr<BackingStore> BackingStore::Allocate(
     Isolate* isolate, size_t byte_length, SharedFlag shared,
     InitializedFlag initialized) {
+  // On goroutine M-threads the "isolate" computed from r13 is per-M
+  // IsolateData, not the real Isolate. Fix it up so array_buffer_allocator()
+  // and all other Isolate field accesses below use the real Isolate pointer.
+  if (v8_goroutine_thread) {
+    isolate = reinterpret_cast<Isolate*>(v8_goroutine_real_isolate);
+  }
   void* buffer_start = nullptr;
   auto allocator = isolate->array_buffer_allocator();
   CHECK_NOT_NULL(allocator);

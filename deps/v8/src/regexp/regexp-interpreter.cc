@@ -7,6 +7,7 @@
 #include "src/regexp/regexp-interpreter.h"
 
 #include "src/base/small-vector.h"
+#include "src/execution/goroutine-flag.h"
 #include "src/base/strings.h"
 #include "src/execution/isolate.h"
 #include "src/logging/counters.h"
@@ -399,6 +400,13 @@ IrregexpInterpreter::Result RawMatch(
     int* output_registers, int output_register_count, int total_register_count,
     int current, uint32_t current_char, RegExp::CallOrigin call_origin,
     const uint32_t backtrack_limit) {
+  // On goroutine M-threads args.GetIsolate() returns per-M IsolateData (not
+  // the real Isolate).  Stack-guard and termination checks inside RawMatch
+  // call isolate->stack_guard() / isolate->heap() which read fields at wrong
+  // offsets from the fake pointer → SIGSEGV.  Fix: swap in the real Isolate.
+  if (v8_goroutine_thread && v8_goroutine_real_isolate) {
+    isolate = reinterpret_cast<Isolate*>(v8_goroutine_real_isolate);
+  }
   DisallowGarbageCollection no_gc;
 
 #if V8_USE_COMPUTED_GOTO

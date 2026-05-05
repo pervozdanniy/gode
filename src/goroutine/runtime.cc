@@ -337,33 +337,6 @@ void Runtime::OnAsync(uv_async_t* handle) {
   // Previously we called MemoryPressureNotification(kModerate) here which
   // started extra incremental marking cycles, causing ~90 Mark-Compact GCs
   // instead of V8's natural ~4 for the same workload.  Removed.
-
-  // Drain the goroutine print queue on the main thread.
-  std::vector<std::string> local;
-  {
-    std::lock_guard<std::mutex> lock(rt->print_mutex_);
-    local.swap(rt->print_queue_);
-  }
-  for (const auto& msg : local) {
-    fwrite(msg.c_str(), 1, msg.size(), stdout);
-  }
-  if (!local.empty()) fflush(stdout);
-}
-
-void Runtime::EnqueuePrint(std::string msg) {
-  if (!async_init_) {
-    // Runtime not initialized (called from main thread before any go()).
-    // Print directly.
-    fwrite(msg.c_str(), 1, msg.size(), stdout);
-    fflush(stdout);
-    return;
-  }
-  {
-    std::lock_guard<std::mutex> lock(print_mutex_);
-    print_queue_.push_back(std::move(msg));
-  }
-  // uv_async_send is thread-safe by spec — safe to call from goroutine threads.
-  uv_async_send(&async_handle_);
 }
 
 void Runtime::NotifyGoroutineAvailable() {

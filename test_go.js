@@ -1,4 +1,4 @@
-const {go} = require('goroutine');
+const {go, goid} = require('goroutine');
 const N = 100;
 
 
@@ -22,15 +22,25 @@ class User {
 }
 
 function worker() {
-    // const obj = {}
+    console.log('Working...', goid());
+    const map = new Map();
+    function inner(key, value) {
+        map.set(`prop_${key}`, value);
+    }
+
+    const obj = {}
+
     const arr = [];
+    // const arr = new Array(1_000_000);
     // const instance = new User();
     let sum = 0;
     for (let j = 0; j < 1_000_000; j++) {
+
         sum += j * 10;
+        // arr[j] = sum;
         const len = arr.push(sum);
-        // obj[`prop_${j}`] = sum
-        // obj['prop'] = sum
+        // obj[`prop_${j}`] = arr[len - 1]
+        // inner(j, sum);
         // obj.curr = arr[len - 1];
     }
     Atomics.add(counter, 0, 1);

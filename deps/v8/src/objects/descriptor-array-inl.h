@@ -7,6 +7,7 @@
 
 #include "src/objects/descriptor-array.h"
 // Include the non-inl header before the rest of the headers.
+#include "src/execution/goroutine-flag.h"
 
 #include "src/execution/isolate.h"
 #include "src/handles/maybe-handles-inl.h"
@@ -151,6 +152,14 @@ InternalIndex DescriptorArray::SearchWithCache(Isolate* isolate,
   DCHECK(IsUniqueName(name));
   int number_of_own_descriptors = map->NumberOfOwnDescriptors();
   if (number_of_own_descriptors == 0) return InternalIndex::NotFound();
+
+  // GOROUTINE PATCH: skip per-Isolate DescriptorLookupCache on M-threads.
+  // The cache is shared across all M-threads and is not thread-safe.
+  // Fall through to a direct search on the descriptor array, which is
+  // read-only and safe for concurrent access.
+  if (v8_goroutine_thread) {
+    return Search(name, number_of_own_descriptors);
+  }
 
   DescriptorLookupCache* cache = isolate->descriptor_lookup_cache();
   int number = cache->Lookup(map, name);

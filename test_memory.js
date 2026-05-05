@@ -1,5 +1,5 @@
 // Minimal test - just check goroutine infrastructure
-const {go, goid, goprint} = require('goroutine');
+const {go, goid} = require('goroutine');
 
 console.log('Memory Goroutine Test');
 console.log('======================\n');
@@ -23,15 +23,12 @@ for (let i = 0; i < N; i++) {
 
         const id = goid();
         // const tid = threadid();
-        // goprint('Goroutine', id, 'started');
         for (let j = 0; j < 1000000; j++) {
             const opa = getObj();
             const fn = getFunc();
             const topa = fn(opa, id);
         }
 
-        // goprint('Goroutine', id, 'result:', JSON.stringify(topa));
-        // goprint('Goroutine thread', tid);
     });
 }
 

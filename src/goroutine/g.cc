@@ -138,17 +138,20 @@ void G::Execute(v8::Isolate* isolate) {
   (void)result;
 
   if (try_catch.HasCaught()) {
-    v8::String::Utf8Value exception(isolate, try_catch.Exception());
-    const char* msg = *exception ? *exception : "(unknown error)";
-
-    fprintf(stderr, "goroutine %llu panic: %s\n",
+    // SAFETY: do NOT call Utf8Value(exception) here — that calls
+    // Error.prototype.toString() which does JS property lookups and races
+    // with other goroutine M-threads doing the same. Use Message->Get()
+    // which returns an already-built String with no JS side effects.
+    // In normal operation this path is never reached because go() in
+    // lib/internal/goroutine.js wraps fn() in a JS try-catch first.
+    const char* msg = "(internal goroutine error)";
+    v8::Local<v8::Message> message = try_catch.Message();
+    v8::String::Utf8Value utf8_msg(
+        isolate,
+        message.IsEmpty() ? v8::String::Empty(isolate) : message->Get());
+    if (*utf8_msg) msg = *utf8_msg;
+    fprintf(stderr, "[GOROUTINE] goroutine %llu: unhandled exception: %s\n",
             static_cast<unsigned long long>(goid_), msg);
-
-    v8::Local<v8::Value> stack_val;
-    if (try_catch.StackTrace(context).ToLocal(&stack_val)) {
-      v8::String::Utf8Value stack(isolate, stack_val);
-      if (*stack) fprintf(stderr, "%s\n", *stack);
-    }
     // Like Go: unrecovered panic in a goroutine crashes the process.
     std::abort();
   }

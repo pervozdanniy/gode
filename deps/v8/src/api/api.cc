@@ -5939,6 +5939,13 @@ static int WriteUtf8Impl(base::Vector<const Char> string, char* write_start,
 int String::WriteUtf8(Isolate* v8_isolate, char* buffer, int capacity,
                       int* nchars_ref, int options) const {
   auto str = Utils::OpenDirectHandle(this);
+  // GOROUTINE PATCH: on M-threads args.GetIsolate() / the Isolate* received
+  // here is a per-M IsolateData (r13 - kRootRegisterBias), not the real
+  // Isolate.  String::Flatten(fake) calls fake->factory() at the wrong struct
+  // offset → UNREACHABLE / SIGSEGV on ConsString input.  Use the real Isolate.
+  if (v8_goroutine_thread && v8_goroutine_real_isolate) {
+    v8_isolate = reinterpret_cast<Isolate*>(v8_goroutine_real_isolate);
+  }
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
   API_RCS_SCOPE(i_isolate, String, WriteUtf8);
   ENTER_V8_NO_SCRIPT_NO_EXCEPTION(i_isolate);
@@ -6021,6 +6028,10 @@ size_t String::WriteUtf8V2(Isolate* v8_isolate, char* buffer, size_t capacity,
                            int flags,
                            size_t* processed_characters_return) const {
   auto str = Utils::OpenDirectHandle(this);
+  // GOROUTINE PATCH: same as WriteUtf8 — fix real Isolate on M-threads.
+  if (v8_goroutine_thread && v8_goroutine_real_isolate) {
+    v8_isolate = reinterpret_cast<Isolate*>(v8_goroutine_real_isolate);
+  }
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
   API_RCS_SCOPE(i_isolate, String, WriteUtf8);
   ENTER_V8_NO_SCRIPT_NO_EXCEPTION(i_isolate);

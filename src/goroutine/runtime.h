@@ -84,10 +84,6 @@ class Runtime {
   // Wake worker M-threads after a goroutine is scheduled.
   void NotifyGoroutineAvailable();
 
-  // Goroutine-safe print: enqueue a message to be printed by the main thread.
-  // Safe to call from any goroutine worker thread.
-  // If called from the main thread (no active runtime), prints directly.
-  void EnqueuePrint(std::string msg);
 
  private:
   Runtime() = default;
@@ -120,9 +116,6 @@ class Runtime {
   // Used by NotifyGoroutineAvailable to avoid spurious sem_post.
   std::atomic<int> sleeping_workers_{0};
 
-  // Print queue: goroutines enqueue here, main thread drains via OnAsync.
-  std::mutex print_mutex_;
-  std::vector<std::string> print_queue_;
 
   // Dead goroutine queue: worker threads enqueue finished G* here instead of
   // calling `delete g` directly. v8::Global::Reset() (in G::~G) is NOT
