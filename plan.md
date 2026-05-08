@@ -1,8 +1,8 @@
 ## Финальный план реализации
 
-> Последнее обновление: 2026-05-05 (Phase 2 partial: per-M FeedbackVector + UpdateInterruptBudget skip → 3.72x scaling; console.log primitives fixed; SeqLock replaced by mutex DCL; KI-7: object logging broken due to Relocatable race; KI-8: Buffer unsafe from goroutines)
+> Последнее обновление: 2026-05-08 (Phase 2 partial + per-M NewSpace allocation WIP: M-threads allocate in PagedNewSpace → Minor MS вместо Mark-Compact; per-M FeedbackVector + UpdateInterruptBudget skip → 3.72x scaling; GC safepoint hooks в allocation failure path; per-thread last_lab_page; NewSpace expansion cap 64MB; proactive minor incremental marking; per-M Minor GC plan in docs/)
 > Статусы: ✅ DONE | 🔨 IN PROGRESS (собрано, не протестировано) | ❌ KNOWN ISSUE | 📋 TODO
-> Текущая фаза: **Phase 2 (per-M FeedbackVectors — partial, per-M JIT — TODO)**
+> Текущая фаза: **Phase 2 (per-M FeedbackVectors — partial, per-M JIT — TODO) + per-M NewSpace allocation (WIP)**
 
 ---
 
@@ -174,22 +174,52 @@ RUNTIME_FUNCTION_RETURNS_TYPE (arguments.h) исправляет isolate в на
 Файл: src/goroutine/runtime.cc
 ```
 
-### KI-2: Goroutine аллокации идут только в Old Space
+### KI-2: Goroutine аллокации идут только в Old Space 🔨 IN PROGRESS (per-M NewSpace)
 
 ```
-Статус: KNOWN, не критично для корректности.
+Статус: АКТИВНО ИСПРАВЛЯЕТСЯ — per-M NewSpace allocation (WIP).
 
 Причина: LocalHeap background тредов не имеет Young Space LAB.
   Все горутинные аллокации → Old Space → повышенное давление на Major GC,
   Minor GC не очищает short-lived горутинные объекты.
 
-Текущее поведение: factory.cc роутит kYoung → kOld для M-тредов.
-  5000 горутин × 40K array → множество Mark-Compact → работает стабильно.
+Текущие изменения (незавершено):
 
-Варианты решения:
-  A) Исследовать Young Space поддержку в LocalHeap (есть в новых V8).
-  B) Per-goroutine bump-pointer arena, сбрасываемая при GState::Gdead.
-     (безопаснее, не требует V8 изменений)
+  1. heap-allocator.cc: ReplaceOldSpaceLAB() теперь создаёт new_space_allocator_
+     backed by реальный PagedNewSpace (--minor-ms) вместо OldSpace.
+     Флаг v8_goroutine_uses_newspace_ (atomic) сигнализирует Mark-Compact.
+
+  2. heap-allocator.cc: CollectGarbage/CollectAllAvailableGarbage —
+     M-тред при allocation failure вызывает v8_goroutine_safepoint_park/unpark
+     и v8_goroutine_lab_sync_after/before_run для корректной регистрации
+     стека горутины как GC root (без этого Minor MS sweeps live objects).
+
+  3. heap.cc: CollectGarbageForBackground() — если v8_goroutine_minor_gc_requested_,
+     делает Minor GC (NEW_SPACE) вместо полного Mark-Compact.
+     + StartMinorMSIncrementalMarkingIfNeeded() при v8_goroutine_uses_newspace_.
+
+  4. heap.cc: ShouldExpandYoungGenerationOnSlowAllocation() — разрешает
+     расширение NewSpace до 64MB при горутинных аллокациях (иначе M-тред
+     fail → Minor GC → не может освободить live objects → GC storm).
+
+  5. main-allocator.cc: per-thread tls_last_lab_page_ вместо shared
+     paged_space()->last_lab_page_ — убирает data race на fast path.
+
+  6. local-heap.cc: ParkSlowPath() вызывает MakeLinearAllocationAreasIterable()
+     + FreeLinearAllocationAreas() перед park — GC может sweep/iterate страницы.
+
+  7. mark-compact.cc + paged-spaces.cc: патчи для корректной работы
+     с горутинными NewSpace аллокациями.
+
+  Полный план: docs/per-m-minor-gc-plan.md
+
+Файлы:
+  deps/v8/src/heap/heap-allocator.cc  — NewSpace allocator + GC hooks
+  deps/v8/src/heap/heap.cc           — Minor GC request + proactive marking
+  deps/v8/src/heap/local-heap.cc     — Free LABs before park
+  deps/v8/src/heap/main-allocator.cc — per-thread last_lab_page
+  deps/v8/src/heap/mark-compact.cc   — goroutine page handling
+  deps/v8/src/heap/paged-spaces.cc   — goroutine page handling
 ```
 
 ### KI-3: console.log и обработка ошибок из горутин ✅ FIXED (частично, см. KI-7)

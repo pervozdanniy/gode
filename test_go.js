@@ -22,7 +22,7 @@ class User {
 }
 
 function worker() {
-    console.log('Working...', goid());
+    // console.log('Working...', goid());
     const map = new Map();
     function inner(key, value) {
         map.set(`prop_${key}`, value);
@@ -38,7 +38,7 @@ function worker() {
 
         sum += j * 10;
         // arr[j] = sum;
-        const len = arr.push(sum);
+        // const len = arr.push(sum);
         // obj[`prop_${j}`] = arr[len - 1]
         // inner(j, sum);
         // obj.curr = arr[len - 1];

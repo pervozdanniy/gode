@@ -283,6 +283,9 @@ void LocalHeap::ParkSlowPath() {
       // overwrite live goroutine objects), then register goroutine mmap stack.
       if (v8_goroutine_thread) {
         v8_goroutine_lab_sync_after_run();
+        // GOROUTINE PATCH: Free all LABs so GC can iterate/sweep those pages.
+        heap_allocator_.MakeLinearAllocationAreasIterable();
+        heap_allocator_.FreeLinearAllocationAreas();
         v8_goroutine_safepoint_park(heap_->isolate());
       }
 

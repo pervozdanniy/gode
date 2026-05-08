@@ -537,12 +537,27 @@ PagedNewSpaceAllocatorPolicy::PagedNewSpaceAllocatorPolicy(
       paged_space_allocator_policy_(
           new PagedSpaceAllocatorPolicy(space->paged_space(), allocator)) {}
 
+// GOROUTINE PATCH: per-thread last_lab_page to avoid shared mutable state.
+static thread_local PageMetadata* tls_last_lab_page_ = nullptr;
+
 bool PagedNewSpaceAllocatorPolicy::EnsureAllocation(
     int size_in_bytes, AllocationAlignment alignment, AllocationOrigin origin) {
-  if (space_->paged_space()->last_lab_page_) {
-    space_->paged_space()->last_lab_page_->DecreaseAllocatedLabSize(
+  // GOROUTINE PATCH: unconditional mutex — both main thread and M-threads
+  // share the same PagedNewSpace free-list.
+  base::MutexGuard guard(space_->paged_space()->mutex());
+
+  if (tls_last_lab_page_) {
+    tls_last_lab_page_->DecreaseAllocatedLabSize(
         allocator_->limit() - allocator_->top());
-    allocator_->ExtendLAB(allocator_->top());
+    // GOROUTINE PATCH: ExtendLAB calls original_limit_relaxed() which requires
+    // SupportsPendingAllocation(). M-thread allocators don't have it.
+    // EnsureAllocation runs on the calling thread, so v8_goroutine_thread TLS
+    // is valid here (unlike GC paths that iterate M-thread allocators from main).
+    if (!v8_goroutine_thread) {
+      allocator_->ExtendLAB(allocator_->top());
+    } else {
+      allocator_->allocation_info().SetLimit(allocator_->top());
+    }
     // No need to write a filler to the remaining lab because it will either be
     // reallocated if the lab can be extended or freed otherwise.
   }
@@ -556,15 +571,23 @@ bool PagedNewSpaceAllocatorPolicy::EnsureAllocation(
     }
   }
 
-  space_->paged_space()->last_lab_page_ =
+  tls_last_lab_page_ =
       PageMetadata::FromAllocationAreaAddress(allocator_->top());
-  DCHECK_NOT_NULL(space_->paged_space()->last_lab_page_);
-  space_->paged_space()->last_lab_page_->IncreaseAllocatedLabSize(
+  DCHECK_NOT_NULL(tls_last_lab_page_);
+  tls_last_lab_page_->IncreaseAllocatedLabSize(
       allocator_->limit() - allocator_->top());
 
-  if (space_heap()->incremental_marking()->IsMinorMarking()) {
-    space_heap()->concurrent_marking()->RescheduleJobIfNeeded(
-        GarbageCollector::MINOR_MARK_SWEEPER);
+  // GOROUTINE PATCH: sync TLS to space for main thread (GC needs it).
+  if (!v8_goroutine_thread) {
+    space_->paged_space()->last_lab_page_ = tls_last_lab_page_;
+  }
+
+  // GOROUTINE PATCH: skip RescheduleJobIfNeeded on M-threads — not safe.
+  if (!v8_goroutine_thread) {
+    if (space_heap()->incremental_marking()->IsMinorMarking()) {
+      space_heap()->concurrent_marking()->RescheduleJobIfNeeded(
+          GarbageCollector::MINOR_MARK_SWEEPER);
+    }
   }
 
   return true;
@@ -631,8 +654,15 @@ bool PagedNewSpaceAllocatorPolicy::TryAllocatePage(int size_in_bytes,
 
 void PagedNewSpaceAllocatorPolicy::FreeLinearAllocationArea() {
   if (!allocator_->IsLabValid()) return;
+  // GOROUTINE PATCH: unconditional mutex for thread safety.
+  base::MutexGuard guard(space_->paged_space()->mutex());
   PageMetadata::FromAllocationAreaAddress(allocator_->top())
       ->DecreaseAllocatedLabSize(allocator_->limit() - allocator_->top());
+  // GOROUTINE PATCH: reset TLS and sync to space.
+  tls_last_lab_page_ = nullptr;
+  if (!v8_goroutine_thread) {
+    space_->paged_space()->last_lab_page_ = nullptr;
+  }
   paged_space_allocator_policy_->FreeLinearAllocationAreaUnsynchronized();
 }
 
@@ -640,8 +670,13 @@ bool PagedSpaceAllocatorPolicy::EnsureAllocation(int size_in_bytes,
                                                  AllocationAlignment alignment,
                                                  AllocationOrigin origin) {
   if (allocator_->identity() == NEW_SPACE) {
-    DCHECK(allocator_->is_main_thread());
-    space_heap()->StartMinorMSIncrementalMarkingIfNeeded();
+    // GOROUTINE PATCH: M-thread allocators don't have is_main_thread() == true
+    // but they can allocate in NEW_SPACE. Only start minor incremental marking
+    // from the main thread.
+    if (allocator_->is_main_thread()) {
+      DCHECK(allocator_->is_main_thread());
+      space_heap()->StartMinorMSIncrementalMarkingIfNeeded();
+    }
   }
   if ((allocator_->identity() != NEW_SPACE) && !allocator_->in_gc()) {
     // Start incremental marking before the actual allocation, this allows the
@@ -866,7 +901,10 @@ bool PagedSpaceAllocatorPolicy::TryAllocationFromFreeList(
   DCHECK_LE(limit, end);
   DCHECK_LE(size_in_bytes, limit - start);
   if (limit != end) {
-    if (!allocator_->supports_extending_lab()) {
+    if (!allocator_->supports_extending_lab() ||
+        !allocator_->SupportsPendingAllocation()) {
+      // GOROUTINE PATCH: M-thread allocators can't extend LAB (no
+      // LinearAreaOriginalData), so free the remainder.
       space_->Free(limit, end - limit);
       end = limit;
     } else {
@@ -882,6 +920,9 @@ bool PagedSpaceAllocatorPolicy::TryAllocationFromFreeList(
 
 bool PagedSpaceAllocatorPolicy::TryExtendLAB(int size_in_bytes) {
   if (!allocator_->supports_extending_lab()) return false;
+  // GOROUTINE PATCH: M-thread allocators have supports_extending_lab() == true
+  // (from header inline) but no LinearAreaOriginalData. Guard here.
+  if (!allocator_->SupportsPendingAllocation()) return false;
   Address current_top = allocator_->top();
   if (current_top == kNullAddress) return false;
   Address current_limit = allocator_->limit();
@@ -921,10 +962,12 @@ void PagedSpaceAllocatorPolicy::FreeLinearAllocationAreaUnsynchronized() {
   Address current_top = allocator_->top();
   Address current_limit = allocator_->limit();
 
-  Address current_max_limit = allocator_->supports_extending_lab()
+  Address current_max_limit = (allocator_->supports_extending_lab() &&
+                                allocator_->SupportsPendingAllocation())
                                   ? allocator_->original_limit_relaxed()
                                   : current_limit;
-  DCHECK_IMPLIES(!allocator_->supports_extending_lab(),
+  DCHECK_IMPLIES(!allocator_->supports_extending_lab() ||
+                     !allocator_->SupportsPendingAllocation(),
                  current_max_limit == current_limit);
 
   allocator_->AdvanceAllocationObservers();

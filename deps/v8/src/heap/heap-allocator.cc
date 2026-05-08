@@ -9,6 +9,19 @@
 #include "src/execution/isolate.h"
 #include "src/execution/goroutine-flag.h"
 #include "src/heap/heap-allocator-inl.h"
+
+// GOROUTINE PATCH: GC safepoint hooks for M-thread allocation failure path.
+extern "C" void v8_goroutine_safepoint_park(v8::internal::Isolate* isolate);
+extern "C" void v8_goroutine_safepoint_unpark();
+extern "C" void v8_goroutine_lab_sync_before_run();
+extern "C" void v8_goroutine_lab_sync_after_run();
+
+namespace v8 { namespace internal {
+// GOROUTINE PATCH: persistent flag — set when ANY M-thread has kYoung
+// allocator backed by PagedNewSpace. Used by Mark-Compact to force in-place
+// page promotion (no object movement).
+std::atomic<bool> v8_goroutine_uses_newspace_{false};
+} }  // namespace v8::internal
 #include "src/heap/heap-inl.h"
 #include "src/heap/local-heap.h"
 #include "src/heap/local-heap-inl.h"
@@ -82,8 +95,20 @@ void HeapAllocator::ReplaceOldSpaceLAB(LinearAllocationArea* lab) {
   // new_allocation_info_.  Create a separate allocator backed by old space
   // so CSA kYoung bump-pointer works via [r13 + new_allocation_info_offset].
   LinearAllocationArea* new_lab = lab - 1;
-  new_space_allocator_.emplace(local_heap_, heap_->old_space(),
-                               MainAllocator::IsNewGeneration::kNo, new_lab);
+  if (v8_flags.minor_ms && heap_->new_space()) {
+    // Real PagedNewSpace (--minor-ms): M-thread kYoung allocations go into
+    // shared PagedNewSpace. SemiSpaceNewSpace is NOT thread-safe.
+    new_space_allocator_.emplace(
+        local_heap_,
+        static_cast<SpaceWithLinearArea*>(heap_->new_space()),
+        MainAllocator::IsNewGeneration::kYes, new_lab);
+    // Signal Mark-Compact to force in-place page promotion.
+    v8_goroutine_uses_newspace_.store(true, std::memory_order_relaxed);
+  } else {
+    // Fallback: backed by old space for CSA kYoung bump-pointer fast path.
+    new_space_allocator_.emplace(local_heap_, heap_->old_space(),
+                                 MainAllocator::IsNewGeneration::kNo, new_lab);
+  }
 }
 
 void HeapAllocator::SetReadOnlySpace(ReadOnlySpace* read_only_space) {
@@ -164,8 +189,26 @@ void HeapAllocator::CollectGarbage(AllocationType allocation) {
     heap_->CollectGarbage(space_to_gc,
                           GarbageCollectionReason::kAllocationFailure);
   } else {
+    // GOROUTINE PATCH: If M-thread's kYoung allocation failed (NewSpace),
+    // signal that we need Minor GC (not full Mark-Compact which evacuates
+    // NewSpace pages and breaks compressed pointers in M-thread registers).
+    if (v8_goroutine_thread && allocation == AllocationType::kYoung) {
+      extern std::atomic<bool> v8_goroutine_minor_gc_requested_;  // heap.cc
+      v8_goroutine_minor_gc_requested_.store(true, std::memory_order_relaxed);
+    }
+    // GOROUTINE PATCH: Register goroutine mmap stack as GC root before
+    // requesting GC. Without this, Minor Mark-Sweep sweeps objects reachable
+    // only from goroutine interpreter frames → stale pointers → SIGSEGV.
+    if (v8_goroutine_thread) {
+      v8_goroutine_lab_sync_after_run();
+      v8_goroutine_safepoint_park(heap_->isolate());
+    }
     // Request GC from main thread.
     heap_->CollectGarbageFromAnyThread(local_heap_);
+    if (v8_goroutine_thread) {
+      v8_goroutine_safepoint_unpark();
+      v8_goroutine_lab_sync_before_run();
+    }
   }
 }
 
@@ -215,8 +258,17 @@ void HeapAllocator::CollectAllAvailableGarbage(AllocationType allocation) {
     // On the main thread we can directly start the GC.
     heap_->CollectAllAvailableGarbage(GarbageCollectionReason::kLastResort);
   } else {
+    // GOROUTINE PATCH: register goroutine stack for GC root scanning.
+    if (v8_goroutine_thread) {
+      v8_goroutine_lab_sync_after_run();
+      v8_goroutine_safepoint_park(heap_->isolate());
+    }
     // Request GC from main thread.
     heap_->CollectGarbageFromAnyThread(local_heap_);
+    if (v8_goroutine_thread) {
+      v8_goroutine_safepoint_unpark();
+      v8_goroutine_lab_sync_before_run();
+    }
   }
 }
 

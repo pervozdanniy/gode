@@ -38,7 +38,7 @@ if (isMainThread) {
     const counter = new Int32Array(workerData);
     for (let i = 0; i < N / PROCS; i++) {
         const map = new Map();
-        console.log('Working...');
+        // console.log('Working...');
 
         function inner(key, value) {
             map.set(`prop_${key}`, value);
@@ -52,7 +52,7 @@ if (isMainThread) {
 
             sum += j * 10;
             // arr[j] = sum;
-            const len = arr.push(sum);
+            // const len = arr.push(sum);
             // obj[`prop_${j}`] = arr[len - 1]
             // inner(j, sum);
             // obj.curr = arr[len - 1];

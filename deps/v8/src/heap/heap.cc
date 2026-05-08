@@ -10,7 +10,11 @@
 // goroutine-flag.h (which cascades through isolate.h → everything).
 extern thread_local __attribute__((tls_model("initial-exec"))) bool v8_goroutine_thread;
 // GC safepoint hooks: register/unregister goroutine mmap stack as GC root.
-namespace v8 { namespace internal { class Isolate; } }
+namespace v8 { namespace internal {
+// GOROUTINE PATCH: atomic flag to request Minor GC from M-threads.
+std::atomic<bool> v8_goroutine_minor_gc_requested_{false};
+class Isolate;
+} }
 extern "C" void v8_goroutine_safepoint_park(v8::internal::Isolate* isolate);
 extern "C" void v8_goroutine_safepoint_unpark();
 #include <algorithm>
@@ -1577,6 +1581,11 @@ void Heap::CollectGarbage(AllocationSpace space,
   if (v8_goroutine_thread) {
     LocalHeap* goroutine_lh = LocalHeap::Current();
     if (goroutine_lh) {
+      // GOROUTINE PATCH: if M-thread triggered GC from NEW_SPACE allocation,
+      // request minor GC instead of full GC.
+      if (space == NEW_SPACE) {
+        v8_goroutine_minor_gc_requested_.store(true, std::memory_order_relaxed);
+      }
       v8_goroutine_safepoint_park(isolate_);
       CollectGarbageFromAnyThread(goroutine_lh, gc_reason);
       v8_goroutine_safepoint_unpark();
@@ -2138,12 +2147,29 @@ bool Heap::CollectionRequested() {
 
 void Heap::CollectGarbageForBackground(LocalHeap* local_heap) {
   CHECK(local_heap->is_main_thread());
+  // GOROUTINE PATCH: When goroutines allocate in PagedNewSpace, start minor
+  // incremental marking proactively (M-threads can't call it themselves).
+  {
+    extern std::atomic<bool> v8_goroutine_uses_newspace_;
+    if (v8_goroutine_uses_newspace_.load(std::memory_order_relaxed)) {
+      StartMinorMSIncrementalMarkingIfNeeded();
+    }
+  }
+  // GOROUTINE PATCH: If M-thread requested Minor GC for NewSpace allocation
+  // failure, do non-evacuating Minor Mark-Sweep instead of full Mark-Compact.
+  if (v8_goroutine_minor_gc_requested_.exchange(false,
+                                                 std::memory_order_relaxed)) {
+    CollectGarbage(NEW_SPACE,
+                   GarbageCollectionReason::kBackgroundAllocationFailure);
+    return;
+  }
   CollectAllGarbage(current_gc_flags_,
                     GarbageCollectionReason::kBackgroundAllocationFailure,
                     current_gc_callback_flags_);
 }
 
 void Heap::CheckCollectionRequested() {
+
   if (!CollectionRequested()) return;
 
   CollectAllGarbage(current_gc_flags_,
@@ -5420,6 +5446,20 @@ bool Heap::ShouldExpandYoungGenerationOnSlowAllocation(size_t allocation_size) {
     // objects should still succeed. Don't let new space grow if it means it
     // will exceed the available size of old space.
     return false;
+  }
+
+  // GOROUTINE PATCH: When goroutines are actively allocating in NewSpace,
+  // allow expansion up to a limit. Without this, M-thread allocations fail →
+  // trigger Minor GC which can't free live objects → fail again → GC storm.
+  // Cap at 64MB to prevent unbounded growth (Mark-Compact promotes in-place).
+  {
+    extern std::atomic<bool> v8_goroutine_uses_newspace_;
+    if (v8_goroutine_uses_newspace_.load(std::memory_order_relaxed)) {
+      size_t new_space_size = new_space() ? new_space()->Size() : 0;
+      if (new_space_size < 64 * MB) {
+        return true;
+      }
+    }
   }
 
   if (incremental_marking()->IsMajorMarking() &&

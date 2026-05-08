@@ -7,6 +7,9 @@
 #include <atomic>
 #include <iterator>
 
+// GOROUTINE PATCH: TLS for M-thread detection in DCHECK.
+extern thread_local __attribute__((tls_model("initial-exec"))) bool v8_goroutine_thread;
+
 #include "src/base/logging.h"
 #include "src/base/platform/mutex.h"
 #include "src/base/safe_conversions.h"
@@ -559,7 +562,8 @@ void PagedSpaceBase::RefillFreeList() {
   DCHECK(identity() == OLD_SPACE || identity() == CODE_SPACE ||
          identity() == SHARED_SPACE || identity() == NEW_SPACE ||
          identity() == TRUSTED_SPACE);
-  DCHECK_IMPLIES(identity() == NEW_SPACE, heap_->IsMainThread());
+  DCHECK_IMPLIES(identity() == NEW_SPACE && !v8_goroutine_thread,
+                 heap_->IsMainThread());
   DCHECK(!is_compaction_space());
 
   for (PageMetadata* p : heap()->sweeper()->GetAllSweptPagesSafe(this)) {

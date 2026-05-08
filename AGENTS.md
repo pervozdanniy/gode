@@ -45,6 +45,7 @@ cd /home/pervozdanniy/code/gode && ...
 | `src/goroutine/scheduler.cc` | Local + global queue, work-stealing |
 | `src/goroutine/stack.{h,cc}` | Stack allocation/pooling (mmap stacks; 64KB default, 256KB ASAN) |
 | `src/goroutine/channel.{h,cc}` | Channel for inter-goroutine communication |
+| `docs/per-m-minor-gc-plan.md` | Per-M Minor GC implementation plan (page tracking, per-M free list, per-M collector) |
 | `deps/v8/src/execution/goroutine-flag.h` | Thin bridge header — the ONLY goroutine include allowed in V8 files; declares `v8_goroutine_thread` and `v8_goroutine_real_isolate` TLS |
 | `deps/v8/src/execution/goroutine-thread.{h,cc}` | Defines `v8_goroutine_thread` and `v8_goroutine_real_isolate` TLS vars; `goroutine-thread.h` re-exports `goroutine-flag.h` |
 | `deps/v8/src/execution/goroutine-thread-state.{h,cc}` | Per-M IsolateData, HSD save/restore, `tls_per_m_isolate_data` TLS |
@@ -55,8 +56,12 @@ cd /home/pervozdanniy/code/gode && ...
 | `deps/v8/src/heap/heap-allocator.{h,cc}` | Patched: `ReplaceOldSpaceLAB()` for shared LAB; slow-path redirect for M-threads |
 | `deps/v8/src/heap/factory.cc` | Patched: goroutine allocation redirect (AllocateRaw, New, AllocateRawWithAllocationSite) |
 | `deps/v8/src/heap/local-heap.cc` | Patched: goroutine safepoint park/unpark with GC registry hooks |
-| `deps/v8/src/heap/heap.cc` | Patched: GC safepoint hooks (`v8_goroutine_safepoint_park/unpark`); GC root scanning for yielded stacks |
+| `deps/v8/src/heap/heap.cc` | Patched: GC safepoint hooks (`v8_goroutine_safepoint_park/unpark`); GC root scanning for yielded stacks; Minor GC request from M-threads (`v8_goroutine_minor_gc_requested_`); proactive `StartMinorMSIncrementalMarkingIfNeeded`; NewSpace expansion cap 64MB for goroutines |
 | `deps/v8/src/heap/collection-barrier.cc` | Patched: M-threads skip `ExecuteWhileParked` callback (mmap stack frames not on system stack → SIGSEGV in conservative GC) |
+| `deps/v8/src/heap/main-allocator.cc` | Patched: per-thread `tls_last_lab_page_` for PagedNewSpace; goroutine-aware page expansion |
+| `deps/v8/src/heap/local-heap.cc` | Patched: goroutine safepoint park/unpark with GC registry hooks; `MakeLinearAllocationAreasIterable` + `FreeLinearAllocationAreas` before park |
+| `deps/v8/src/heap/mark-compact.cc` | Patched: goroutine NewSpace page handling |
+| `deps/v8/src/heap/paged-spaces.cc` | Patched: goroutine NewSpace page handling |
 | `deps/v8/src/execution/isolate.h` | Patched `thread_local_top()` / `handle_scope_data()` / `handle_scope_implementer()` via `tls_per_m_isolate_data` |
 | `deps/v8/src/execution/arguments.h` | Patched: `RUNTIME_FUNCTION` macro overrides computed `Isolate*` with `v8_goroutine_real_isolate` on M-threads |
 | `deps/v8/src/execution/execution.cc` | Patched: stack-guard uses per-M IsolateData root on M-threads |
@@ -126,7 +131,7 @@ threadid();             // Get OS thread ID (Linux gettid) of the M-thread execu
 - **Lock-safepoint deadlock (FIXED)**: any mutex held during V8 allocations must NOT use blocking `mutex.lock()` on goroutine M-threads, because if GC fires the thread is stuck in the kernel and cannot park → GC waits forever. Fix: `v8_goroutine_map_transition_lock()` uses `try_lock()` + `LocalHeap::Safepoint()` spin loop so GC can always proceed. See `goroutine-shape-lock.cc`.
 - **Shared FeedbackVectors / per-M FV (Phase 2 — ACTIVE)**: goroutines now get per-M FeedbackVector clones via `CreatePerMFeedbackVector` (called lazily from `BytecodeBudgetInterrupt`). `UpdateInterruptBudget` in `interpreter-assembler.cc` skips the shared `FeedbackCell::interrupt_budget` store on M-threads (returns `INT32_MAX/2`) to avoid MESI cache-line bouncing. IC slot writes (`ComputeHandler`, `SetOptimizedCode`) are still skipped on M-threads (`feedback-vector-inl.h` patches). Per-M JIT tier-up is still disabled (Phase 2 TODO).
 - **`v8_goroutine_real_isolate` TLS**: `CEntryStub` computes `Isolate*` as `r13 - kRootRegisterBias`, which resolves to per-M IsolateData (not the real Isolate). `v8_goroutine_real_isolate` holds the correct value. Set in `goroutine-thread.cc`, consumed by the `RUNTIME_FUNCTION` macro in `arguments.h` and in `string-table.cc`. Always set this alongside `v8_goroutine_thread` when activating an M-thread.
-- **Allocation performance (inherent ~35% gap on alloc-heavy workloads)**: goroutines allocate everything into old space (no real young generation). This causes: (1) write/marking barriers on every old-space store during incremental marking; (2) heavier Mark-Compact GC instead of cheap Scavenge. Compute-only goroutines have **zero overhead** vs main thread. Current mitigations: `BoundAllocationLimit` floor 64MB in `heap-controller.cc` (reduces GC from 90→45); page-expansion-first LAB refill in `main-allocator.cc` (reduces slow-path from 137K→14K calls); CSA fast-path via per-M `new_allocation_info_` works (99.86% of allocations inline). Object literal allocation (`{a:1, b:2}`) has residual overhead from map-transition mutex contention (mutex + DCL fast path). **TODO**: investigate per-M young generation or write-barrier skip for goroutine-allocated pages to close the remaining gap.
+- **Allocation performance (WIP: per-M NewSpace allocation)**: goroutines previously allocated everything into old space (no real young generation). **Active fix**: `ReplaceOldSpaceLAB()` now creates `new_space_allocator_` backed by real `PagedNewSpace` (with `--minor-ms`), enabling Minor Mark-Sweep for goroutine allocations instead of full Mark-Compact. GC safepoint hooks added to allocation failure path (`CollectGarbage`/`CollectAllAvailableGarbage`); per-thread `tls_last_lab_page_` eliminates data race; `ShouldExpandYoungGenerationOnSlowAllocation` allows up to 64MB for goroutine NewSpace; `CollectGarbageForBackground` triggers Minor GC when `v8_goroutine_minor_gc_requested_`; `ParkSlowPath` frees LABs before park. Full plan: `docs/per-m-minor-gc-plan.md`. **Remaining TODO**: per-M page tracking, per-M free list, per-M Minor GC collector, scheduler local-yield + work-steal page promotion.
 
 ## ASAN Build
 

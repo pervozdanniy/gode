@@ -4928,6 +4928,20 @@ void MarkCompactCollector::EvacuatePagesInParallel() {
   // before old space evacuation.
   bool force_page_promotion =
       heap_->IsGCWithStack() && !v8_flags.compact_with_stack;
+  // GOROUTINE PATCH: When goroutines allocate in PagedNewSpace (--minor-ms),
+  // force in-place page promotion for ALL NewSpace pages. Object-by-object
+  // evacuation (kObjectsNewToOld) moves objects to new addresses, but
+  // goroutine M-threads may hold stale compressed pointers in callee-saved
+  // CPU registers (saved by C++ calling convention during allocation slow
+  // path). These registers are not visible to the GC root scanner.
+  // In-place promotion (kPageNewToOld) only changes page ownership from
+  // NewSpace to OldSpace without moving any objects.
+  {
+    extern std::atomic<bool> v8_goroutine_uses_newspace_;
+    if (v8_goroutine_uses_newspace_.load(std::memory_order_relaxed)) {
+      force_page_promotion = true;
+    }
+  }
   for (PageMetadata* page : new_space_evacuation_pages_) {
     intptr_t live_bytes_on_page = page->live_bytes();
     DCHECK_LT(0, live_bytes_on_page);
