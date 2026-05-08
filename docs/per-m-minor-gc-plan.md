@@ -1,5 +1,29 @@
 # Per-M Minor GC — Implementation Plan
 
+## Current Status (Phase 0 — Shared NewSpace with Minor MS)
+
+Before implementing per-M page tracking (Phase 1+), a simpler approach was implemented: M-threads allocate into the **shared PagedNewSpace** (with `--minor-ms`), and Minor Mark-Sweep collects young objects instead of promoting everything to OldSpace.
+
+### What's Done
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| `ReplaceOldSpaceLAB()` — new_space_allocator_ | ✅ Done | M-threads get a `new_space_allocator_` backed by real PagedNewSpace (not OldSpace). Per-M LAB via `IsolateData::new_allocation_info_` shared between Ignition (r13) and LocalHeap. |
+| Per-thread `tls_last_lab_page_` | ✅ Done | Eliminates data race on LAB page tracking in `main-allocator.cc`. |
+| NewSpace expansion cap (64MB) | ✅ Done | `ShouldExpandYoungGenerationOnSlowAllocation` allows goroutine NewSpace to grow up to 64MB. |
+| `v8_goroutine_minor_gc_requested_` | ✅ Done | M-thread sets atomic flag on kYoung allocation failure; main thread checks in `CollectGarbageForBackground` and runs `CollectGarbage(NEW_SPACE, ...)`. |
+| GC safepoint park/unpark in allocation paths | ✅ Done | `heap.cc` and `heap-allocator.cc`: M-threads call `v8_goroutine_safepoint_park` before requesting GC, so SafepointScope finds `running_count=0`. |
+| `FilterNormalObject` map validation | ✅ Done | Conservative stack scanning validates Map addresses via `LookupChunkContainingAddressInSafepoint` + meta-map ReadOnlySpace check. Prevents SIGSEGV from false-positive pointers. |
+| `StartMinorMSIncrementalMarkingIfNeeded` | ❌ Removed | Was causing hangs — main thread created SafepointScope while M-threads in tight loops couldn't respond. |
+
+### Known Issues (Phase 0)
+
+1. **M-threads don't respond to safepoints in tight loops**: `UpdateInterruptBudget` returns `INT32_MAX/2` for M-threads (MESI bouncing avoidance), so interrupt handler never fires → `Safepoint()` never called. GC only triggers from allocation failure (M-thread parks itself). If main thread independently needs SafepointScope, M-threads in tight loops cause deadlock. **Workaround**: removed all main-thread-initiated SafepointScope paths (no `StartMinorMSIncrementalMarkingIfNeeded`). **Fix**: per-M budget counter in IsolateData (Phase 1+ TODO).
+
+2. **`FilterNormalObject` — why goroutines need it but worker threads don't**: standard V8 background threads use conservative stack scanning without Map validation. Goroutines trigger SIGSEGV in `SizeFromMap` from false-positive pointers. Possible causes: mmap stack reuse (stale pointers), smaller stacks (64KB), different LAB/page layout. Needs investigation.
+
+3. **GC initiation is purely reactive**: Minor GC only happens when an M-thread's allocation fails. No proactive incremental marking. If goroutines generate garbage slowly (long-running compute with few allocations), NewSpace fills up gradually and the first allocation failure triggers a potentially large Minor GC pause. Per-M Minor GC (Phase 4) would fix this.
+
 ## Problem
 
 M-threads can't trigger Minor GC. When NewSpace is full, objects promote to OldSpace → excessive Mark-Compact (~10 per test), zero Minor MS.

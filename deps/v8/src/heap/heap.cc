@@ -2149,12 +2149,12 @@ void Heap::CollectGarbageForBackground(LocalHeap* local_heap) {
   CHECK(local_heap->is_main_thread());
   // GOROUTINE PATCH: When goroutines allocate in PagedNewSpace, start minor
   // incremental marking proactively (M-threads can't call it themselves).
-  {
-    extern std::atomic<bool> v8_goroutine_uses_newspace_;
-    if (v8_goroutine_uses_newspace_.load(std::memory_order_relaxed)) {
-      StartMinorMSIncrementalMarkingIfNeeded();
-    }
-  }
+  // {
+  //   extern std::atomic<bool> v8_goroutine_uses_newspace_;
+  //   if (v8_goroutine_uses_newspace_.load(std::memory_order_relaxed)) {
+  //     StartMinorMSIncrementalMarkingIfNeeded();
+  //   }
+  // }
   // GOROUTINE PATCH: If M-thread requested Minor GC for NewSpace allocation
   // failure, do non-evacuating Minor Mark-Sweep instead of full Mark-Compact.
   if (v8_goroutine_minor_gc_requested_.exchange(false,
@@ -2444,7 +2444,9 @@ bool Heap::CollectGarbageFromAnyThread(LocalHeap* local_heap,
     CollectAllGarbage(current_gc_flags_, gc_reason, current_gc_callback_flags_);
     return true;
   } else {
-    if (!collection_barrier_->TryRequestGC()) return false;
+    if (!collection_barrier_->TryRequestGC()) {
+      return false;
+    }
 
     const LocalHeap::ThreadState old_state =
         main_thread_local_heap()->state_.SetCollectionRequested();

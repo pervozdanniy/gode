@@ -201,6 +201,7 @@ void HeapAllocator::CollectGarbage(AllocationType allocation) {
     // only from goroutine interpreter frames → stale pointers → SIGSEGV.
     if (v8_goroutine_thread) {
       v8_goroutine_lab_sync_after_run();
+      MakeLinearAllocationAreasIterable();
       v8_goroutine_safepoint_park(heap_->isolate());
     }
     // Request GC from main thread.
@@ -261,6 +262,7 @@ void HeapAllocator::CollectAllAvailableGarbage(AllocationType allocation) {
     // GOROUTINE PATCH: register goroutine stack for GC root scanning.
     if (v8_goroutine_thread) {
       v8_goroutine_lab_sync_after_run();
+      MakeLinearAllocationAreasIterable();
       v8_goroutine_safepoint_park(heap_->isolate());
     }
     // Request GC from main thread.

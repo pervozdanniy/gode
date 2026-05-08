@@ -387,16 +387,27 @@ Tagged<Object> BytecodeBudgetInterruptWithStackCheck(Isolate* isolate,
   // so `isolate` is a garbage pointer. Use Isolate::Current() instead.
   // Reset FeedbackCell budget to INT32_MAX/2 so it doesn't fire on every
   // subsequent JumpLoop. No tiering on M-threads (would deadlock).
+  // No tiering on M-threads (would deadlock).
   if (v8_goroutine_thread) {
     Isolate* real = Isolate::Current();
     DirectHandle<JSFunction> fn = args.at<JSFunction>(0);
-    fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
+    // fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
+    // Reset budget to a moderate value so the interrupt fires periodically
+    // (every ~64K backward branches). This allows Safepoint() to be checked
+    // regularly. NOT INT32_MAX/2 — that would make the handler fire only once.
+    fn->raw_feedback_cell()->set_interrupt_budget(64 * 1024);
 
     // Phase 2: create per-M FeedbackVector for this function.
     if (fn->has_feedback_vector()) {
       Tagged<FeedbackVector> fv = fn->feedback_vector();
       v8_goroutine_create_per_m_feedback(fn->ptr(), fv.ptr());
     }
+
+    // Cooperative GC safepoint: check if main thread requested a safepoint.
+    // Without this, M-threads in tight loops never respond to
+    // SafepointRequested → main thread hangs in WaitUntilRunning.
+    LocalHeap* lh = LocalHeap::Current();
+    if (lh) lh->Safepoint();
 
     return ReadOnlyRoots(real).undefined_value();
   }
@@ -427,16 +438,23 @@ Tagged<Object> BytecodeBudgetInterrupt(Isolate* isolate, RuntimeArguments& args,
   // GOROUTINE PATCH: Must check BEFORE HandleScope — isolate from r13 is
   // garbage on M-threads. Reset FeedbackCell to INT32_MAX/2 so the budget
   // interrupt doesn't re-fire on every subsequent JumpLoop.
+  // garbage on M-threads. Reset FeedbackCell to INT32_MAX/2 so the budget
+  // interrupt doesn't re-fire on every subsequent JumpLoop.
   if (v8_goroutine_thread) {
     Isolate* real = Isolate::Current();
     DirectHandle<JSFunction> fn = args.at<JSFunction>(0);
-    fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
+    // fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
+    // fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
 
     // Phase 2: create per-M FeedbackVector for this function.
     if (fn->has_feedback_vector()) {
       Tagged<FeedbackVector> fv = fn->feedback_vector();
       v8_goroutine_create_per_m_feedback(fn->ptr(), fv.ptr());
     }
+
+    // Cooperative GC safepoint (see WithStackCheck variant for details).
+    LocalHeap* lh = LocalHeap::Current();
+    if (lh) lh->Safepoint();
 
     return ReadOnlyRoots(real).undefined_value();
   }

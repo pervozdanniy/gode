@@ -669,6 +669,11 @@ void MinorMarkSweepCollector::MarkRoots(
   }
 }
 
+// GOROUTINE PATCH: static allocator pointer for FilterNormalObject to validate
+// Map addresses during conservative stack scanning. Set before scanning,
+// cleared after. Safe because conservative scanning is single-threaded (main).
+static MemoryAllocator* s_conservative_scan_allocator_ = nullptr;
+
 namespace {
 class MinorMSConservativeStackVisitor
     : public ConservativeStackVisitorBase<MinorMSConservativeStackVisitor> {
@@ -686,7 +691,32 @@ class MinorMSConservativeStackVisitor
                : chunk->IsToPage();
   }
   static bool FilterLargeObject(Tagged<HeapObject>, MapWord) { return true; }
-  static bool FilterNormalObject(Tagged<HeapObject>, MapWord, MarkingBitmap*) {
+  static bool FilterNormalObject(Tagged<HeapObject> obj, MapWord map_word, MarkingBitmap*) {
+    // GOROUTINE PATCH: Conservative stack scanning may walk through objects
+    // on NewSpace pages that have garbage map words (false positive from
+    // stack values matching page addresses). Validate:
+    // 1) The decompressed Map address is on a known heap page.
+    // 2) The Map's own map (meta_map) is in ReadOnlySpace — all valid Maps
+    //    point to the meta_map which is always in ReadOnlySpace.
+    if (V8_UNLIKELY(!s_conservative_scan_allocator_)) return true;
+    Tagged<Map> map = map_word.ToMap();
+
+    // Check 1: map address on a valid page.
+    const MemoryChunk* map_chunk =
+        s_conservative_scan_allocator_->LookupChunkContainingAddressInSafepoint(
+            map.ptr());
+    if (V8_UNLIKELY(!map_chunk)) return false;
+
+    // Check 2: map's own map_word must point to meta_map in ReadOnlySpace.
+    // Reading from map.ptr() is safe because it's on a valid page (check 1).
+    MapWord map_of_map = Tagged<HeapObject>(map)->map_word(kRelaxedLoad);
+    if (V8_UNLIKELY(map_of_map.IsForwardingAddress())) return true;  // GC in progress, ok
+    Address meta_map_addr = map_of_map.ToMap().ptr();
+    const MemoryChunk* meta_chunk =
+        s_conservative_scan_allocator_->LookupChunkContainingAddressInSafepoint(
+            meta_map_addr);
+    if (V8_UNLIKELY(!meta_chunk || !meta_chunk->InReadOnlySpace())) return false;
+
     return true;
   }
   static void HandleObjectFound(Tagged<HeapObject>, size_t, MarkingBitmap*) {}
@@ -700,9 +730,14 @@ void MinorMarkSweepCollector::MarkRootsFromConservativeStack(
   if (!heap_->IsGCWithStack()) return;
   TRACE_GC(heap_->tracer(), GCTracer::Scope::CONSERVATIVE_STACK_SCANNING);
 
+  // GOROUTINE PATCH: set allocator for FilterNormalObject map validation.
+  s_conservative_scan_allocator_ = heap_->memory_allocator();
+
   MinorMSConservativeStackVisitor stack_visitor(heap_->isolate(), root_visitor);
 
   heap_->IterateConservativeStackRoots(&stack_visitor);
+
+  s_conservative_scan_allocator_ = nullptr;
 }
 
 void MinorMarkSweepCollector::MarkLiveObjects() {

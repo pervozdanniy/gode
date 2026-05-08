@@ -278,14 +278,12 @@ void LocalHeap::ParkSlowPath() {
       DCHECK(current_state.IsSafepointRequested());
       DCHECK(!current_state.IsCollectionRequested());
 
-      // GOROUTINE PATCH: If this M-thread is running a goroutine, flush the
-      // per-M LAB top to LocalHeap first (so FreeLinearAllocationAreas doesn't
-      // overwrite live goroutine objects), then register goroutine mmap stack.
+      // GOROUTINE PATCH: Flush per-M LAB top and fill with fillers.
+      // Do NOT call FreeLinearAllocationAreas() — mutex deadlock risk.
+      // GC will free LABs itself within the safepoint scope.
       if (v8_goroutine_thread) {
         v8_goroutine_lab_sync_after_run();
-        // GOROUTINE PATCH: Free all LABs so GC can iterate/sweep those pages.
         heap_allocator_.MakeLinearAllocationAreasIterable();
-        heap_allocator_.FreeLinearAllocationAreas();
         v8_goroutine_safepoint_park(heap_->isolate());
       }
 
@@ -411,8 +409,14 @@ void LocalHeap::SleepInSafepoint() {
   // register goroutine frames via GoroutineGCRegistry instead of the
   // conservative stack marker mechanism, then park/wait/unpark directly.
   if (v8_goroutine_thread) {
-    // With shared LAB (ReplaceOldSpaceLAB), FreeLinearAllocationAreas() sees
-    // the correct top directly — no need to flush. Just park for GC.
+    // Flush per-M LAB top, fill unused LAB with fillers so GC can safely
+    // iterate NewSpace pages. Do NOT call FreeLinearAllocationAreas() here —
+    // it acquires space_->mutex() which may be held by the main thread
+    // (inside EnsureAllocation → SafepointScope) → deadlock.
+    // GC itself will free LABs via Heap::FreeLinearAllocationAreas() within
+    // the safepoint scope after all threads are parked.
+    v8_goroutine_lab_sync_after_run();
+    heap_allocator_.MakeLinearAllocationAreasIterable();
     v8_goroutine_safepoint_park(heap_->isolate());
 
     ThreadState old_state = state_.SetParked();

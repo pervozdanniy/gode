@@ -565,6 +565,11 @@ bool PagedNewSpaceAllocatorPolicy::EnsureAllocation(
   if (!paged_space_allocator_policy_->EnsureAllocation(size_in_bytes, alignment,
                                                        origin)) {
     if (!TryAllocatePage(size_in_bytes, origin)) {
+      // GOROUTINE PATCH: M-threads must NOT call WaitForSweepingForAllocation —
+      // sweeper job handles, their absl::Mutex, and concurrent sweeping tasks
+      // belong to the main thread. Calling into them from M-threads can hit a
+      // freed/corrupted Mutex → SIGSEGV.
+      if (v8_goroutine_thread) return false;
       if (!WaitForSweepingForAllocation(size_in_bytes, origin)) {
         return false;
       }
