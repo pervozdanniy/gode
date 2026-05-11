@@ -9,6 +9,8 @@
 #include "src/execution/goroutine-flag.h"
 #include "src/execution/interrupts-scope.h"
 #include "src/execution/isolate.h"
+#include "src/heap/local-heap.h"
+#include "src/heap/local-heap-inl.h"
 #include "src/execution/protectors-inl.h"
 #include "src/execution/simulator.h"
 #include "src/logging/counters.h"
@@ -308,28 +310,22 @@ Tagged<Object> StackGuard::HandleInterrupts(InterruptLevel level) {
     isolate_->heap()->MonotonicallyIncreasingTimeInMs();
   }
 
-  // GOROUTINE PATCH: M-thread budget interrupt fast path.
-  // FetchAndClearInterrupts() takes ExecutionAccess → locks isolate's global
-  // break_access_ mutex. With N M-threads each handling budget interrupts
-  // every ~1000 bytecodes, this single mutex becomes the serialization
-  // bottleneck that kills parallelism (GOMAXPROCS=4 runs no faster than =2).
+  // GOROUTINE PATCH: M-thread interrupt handling.
+  // Skip FetchAndClearInterrupts() — per-M StackGuard has no real interrupt
+  // flags set. GC coordination uses LocalHeap SafepointRequested, not
+  // StackGuard interrupt flags. We only get here because per-M jslimit was
+  // poisoned (set to kInterruptLimit) by v8_goroutine_poison_stack_limits()
+  // when GC was requested, OR because per-M interrupt budget exhausted.
   //
-  // Fix: on M-threads, skip FetchAndClearInterrupts entirely.
-  // • Per-M StackGuard (via isolate_data() patch) has no real interrupt flags
-  //   set — GC uses LocalHeap Park/Unpark, not StackGuard flags.
-  // • thread_local_ here IS the per-M StackGuard's fields (not shared).
-  // • Reset jslimit → real_jslimit_ without any lock (per-M data, no races).
-  // • TERMINATE_EXECUTION is rare; if needed, it can be set via per-M flags.
+  // Call LocalHeap::Safepoint() which checks the SafepointRequested bit:
+  //   - If set → parks this M-thread, waits for GC to complete, unparks.
+  //   - If not set → single atomic load, returns immediately (~1ns).
   if (v8_goroutine_thread) {
-    // Reset jslimit so Ignition doesn't immediately re-trigger the budget
-    // interrupt on the very next bytecode.
+    // Safepoint check: park if GC requested.
+    LocalHeap* lh = LocalHeap::Current();
+    if (lh) lh->Safepoint();
+    // Reset jslimit so Ignition doesn't immediately re-trigger.
     thread_local_.set_jslimit(thread_local_.real_jslimit_);
-    // NOTE: by returning here we also implicitly prevent M-threads from
-    // ever reaching GC_REQUEST / START_INCREMENTAL_MARKING / GLOBAL_SAFEPOINT
-    // / INSTALL_CODE / DEOPT_MARKED_ALLOCATION_SITES etc. — all of which
-    // call IsolateSafepoint::EnterLocalSafepointScope() and would deadlock
-    // when the main thread is already holding the safepoint mutex.
-    // This early return is a strict superset of the old flag-masking fix.
     return ReadOnlyRoots(isolate_).undefined_value();
   }
 

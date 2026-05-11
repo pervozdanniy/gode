@@ -23,6 +23,9 @@
 #include "src/logging/counters-scopes.h"
 #include "src/objects/objects.h"
 
+// GOROUTINE: poison all M-thread jslimits when requesting safepoint.
+extern "C" void v8_goroutine_poison_stack_limits();
+
 namespace v8 {
 namespace internal {
 
@@ -167,6 +170,13 @@ void IsolateSafepoint::SetSafepointRequestedFlags(
                   local_heap->is_main_thread());
     CHECK(!old_state.IsSafepointRequested());
   }
+
+  // GOROUTINE: Poison all M-thread jslimits so they stop at the next
+  // backward branch (JumpLoop). Without this, M-threads executing tight
+  // pure-computation loops with no allocations would never check
+  // SafepointRequested and the main thread would hang in
+  // WaitUntilRunningThreadsInSafepoint forever.
+  v8_goroutine_poison_stack_limits();
 }
 
 void IsolateSafepoint::LockMutex(LocalHeap* local_heap) {

@@ -25,6 +25,9 @@ extern "C" void  v8_goroutine_p_state_deactivate();
 extern "C" void  v8_goroutine_p_state_destroy(void* state);
 // Set per-M StackGuard limit (does NOT touch shared Isolate::stack_size_).
 extern "C" void  v8_goroutine_set_stack_limit(uintptr_t limit);
+// Register/deregister per-M IsolateData for jslimit poisoning (safepoints).
+extern "C" void  v8_goroutine_register_m_isolate_data(uint32_t m_id);
+extern "C" void  v8_goroutine_deregister_m_isolate_data(uint32_t m_id);
 
 // Per-M LocalHeap for GC safepoint coordination (goroutine-local-heap.cc).
 // LocalHeap also calls Isolate::SetCurrent() so v8::Isolate::GetCurrent()
@@ -117,6 +120,8 @@ void M::ThreadLoop() {
 
   // Set M-thread id for GC registry per-M slot indexing.
   v8_goroutine_gc_set_m_id(id_);
+  // Register per-M IsolateData so safepoint can poison our jslimit.
+  v8_goroutine_register_m_isolate_data(id_);
 
   // Point LocalHeap's old-space allocator at per-M IsolateData's LAB so that
   // Ignition's r13-based bump-pointer fast path and the allocator share the
@@ -203,6 +208,9 @@ void M::ThreadLoop() {
 
   // ThreadLoop exiting. Flush any remaining dead goroutines from local batch.
   FlushDeadBatch();
+
+  // Deregister per-M IsolateData before teardown.
+  v8_goroutine_deregister_m_isolate_data(id_);
 
   // Destroy LocalHeap from THIS (worker) thread — required
   // because LocalHeap::~LocalHeap() uses thread-local write barriers and

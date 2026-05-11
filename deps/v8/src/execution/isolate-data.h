@@ -159,7 +159,12 @@ struct JSBuiltinDispatchHandleRoot {
   V(BuiltinEntryTable, Builtins::kBuiltinCount* kSystemPointerSize,            \
     builtin_entry_table)                                                       \
   V(BuiltinTable, Builtins::kBuiltinCount* kSystemPointerSize, builtin_table)  \
-  ISOLATE_DATA_FIELDS_LEAPTIERING(V)
+  ISOLATE_DATA_FIELDS_LEAPTIERING(V)                                          \
+  /* GOROUTINE: Per-M interrupt budget for backward branches (JumpLoop).       \
+     Each M-thread decrements its own copy via [r13 + offset] — no MESI        \
+     cache-line bouncing. Budget exhaustion triggers BytecodeBudgetInterrupt    \
+     → StackLimitCheck → HandleInterrupts → Safepoint(). */                    \
+  V(GoroutineInterruptBudget, kInt32Size, goroutine_interrupt_budget)
 
 #ifdef V8_COMPRESS_POINTERS
 #define ISOLATE_DATA_FIELDS_POINTER_COMPRESSION(V)      \
@@ -537,12 +542,19 @@ class IsolateData final {
       builtin_dispatch_table_[JSBuiltinDispatchHandleRoot::kTableSize] = {};
 #endif  // V8_ENABLE_LEAPTIERING_BOOL && !V8_STATIC_DISPATCH_HANDLES_BOOL
 
-  // Per-M goroutine interrupt budget field removed — we now use FeedbackCell
-  // for all threads (original V8 behavior). Goroutines handle the interrupt
-  // in BytecodeBudgetInterrupt by resetting FeedbackCell to INT32_MAX/2.
+  // GOROUTINE: Per-M interrupt budget.  On M-threads this is decremented by
+  // UpdateInterruptBudget (via [r13 + offset]) instead of the shared
+  // FeedbackCell::interrupt_budget.  Initialized to kGoroutineDefaultBudget in
+  // CreatePState; reset in BytecodeBudgetInterrupt after each firing.
+  // On the main-thread IsolateData this field is 0 and never touched by
+  // generated code (the goroutine flag branch skips it).
+  int32_t goroutine_interrupt_budget_ = 0;
 
  public:
-  // Placeholder accessor kept for any remaining references — remove if unused.
+  static constexpr int32_t kGoroutineDefaultBudget = 65536;
+  void ResetGoroutineInterruptBudget() {
+    goroutine_interrupt_budget_ = kGoroutineDefaultBudget;
+  }
 
  private:
   // Ensure the size is 8-byte aligned in order to make alignment of the field

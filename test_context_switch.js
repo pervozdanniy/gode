@@ -1,4 +1,4 @@
-const { go, yield: goyield, goid } = require('goroutine');
+const { go, goyield, goid } = require('goroutine');
 
 console.log('=== Context Switch Test ===\n');
 

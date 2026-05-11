@@ -24,6 +24,7 @@ class User {
 function worker() {
     // console.log('Working...', goid());
     const map = new Map();
+
     function inner(key, value) {
         map.set(`prop_${key}`, value);
     }
@@ -51,6 +52,9 @@ for (let i = 0; i < N; i++) {
 }
 
 function waitAll() {
+    for (let i = 0; i < 100_000; i++) {
+        const a = {i, a: [i]}
+    }
     const done = Atomics.load(counter, 0);
     if (done < N) {
         console.log('Curr', done);

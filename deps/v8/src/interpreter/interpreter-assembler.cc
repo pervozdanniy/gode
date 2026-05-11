@@ -1065,15 +1065,13 @@ InterpreterAssembler::CallRuntimeN(TNode<Uint32T> function_id,
 
 TNode<Int32T> InterpreterAssembler::UpdateInterruptBudget(
     TNode<Int32T> weight) {
-  // GOROUTINE: On M-threads, skip the shared FeedbackCell budget update.
-  // The interrupt_budget field lives in a shared heap object (FeedbackCell).
-  // With N M-threads all decrementing the same cache line on every JumpLoop,
-  // this causes catastrophic MESI cache-line bouncing (40M invalidations for
-  // 4 threads × 10M iterations). On M-threads we return a large positive
-  // value so the budget-check branch is never taken.
+  // GOROUTINE: On M-threads, use per-M interrupt budget stored in IsolateData
+  // (accessed via [r13 + offset]) instead of the shared FeedbackCell.
+  // Each M-thread has its own IsolateData copy → no MESI cache-line bouncing.
+  // When budget goes negative → BytecodeBudgetInterrupt fires →
+  // StackLimitCheck → HandleInterrupts → Safepoint().
   Label main_thread_path(this), goroutine_path(this), done(this);
-  // Default to large positive value (goroutine fast path — no interrupt).
-  TVARIABLE(Int32T, result, Int32Constant(INT32_MAX / 2));
+  TVARIABLE(Int32T, result);
 
   // Check goroutine flag: [r13 + tables_alignment_padding_offset] == 0 → main.
   TNode<Uint8T> goroutine_flag = LoadUint8FromRootRegister(
@@ -1082,8 +1080,18 @@ TNode<Int32T> InterpreterAssembler::UpdateInterruptBudget(
          &main_thread_path, &goroutine_path);
 
   BIND(&goroutine_path);
-  // M-thread: skip FeedbackCell access entirely. result already INT32_MAX/2.
-  Goto(&done);
+  {
+    // M-thread: decrement per-M budget in IsolateData via r13.
+    // ExternalReference resolves to [r13 + goroutine_interrupt_budget_offset].
+    auto budget_ref = ExternalConstant(ExternalReference::Create(
+        IsolateFieldId::kGoroutineInterruptBudget));
+    TNode<Int32T> old_budget = UncheckedCast<Int32T>(
+        Load(MachineType::Int32(), budget_ref));
+    TNode<Int32T> new_budget = Int32Sub(old_budget, weight);
+    StoreNoWriteBarrier(MachineRepresentation::kWord32, budget_ref, new_budget);
+    result = new_budget;
+    Goto(&done);
+  }
 
   BIND(&main_thread_path);
   {

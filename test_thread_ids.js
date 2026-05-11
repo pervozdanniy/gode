@@ -11,7 +11,7 @@
 
 'use strict';
 
-const { go, yield: goyield, goid, threadid } = require('goroutine');
+const { go, goyield, goid, threadid } = require('goroutine');
 
 const mainTid = threadid();
 console.log(`Main thread OS tid: ${mainTid}\n`);

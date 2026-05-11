@@ -20,6 +20,7 @@
 #include "src/runtime/runtime-utils.h"
 #include "src/utils/ostreams.h"
 #include "src/execution/goroutine-flag.h"
+#include "src/execution/goroutine-thread-state.h"
 #include "src/heap/local-heap.h"
 #include "src/heap/local-heap-inl.h"
 
@@ -385,17 +386,13 @@ Tagged<Object> BytecodeBudgetInterruptWithStackCheck(Isolate* isolate,
   // GOROUTINE PATCH: Must check BEFORE HandleScope — on M-threads `isolate`
   // is computed as (r13 - kRootRegisterBias) where r13 = per-M IsolateData,
   // so `isolate` is a garbage pointer. Use Isolate::Current() instead.
-  // Reset FeedbackCell budget to INT32_MAX/2 so it doesn't fire on every
-  // subsequent JumpLoop. No tiering on M-threads (would deadlock).
-  // No tiering on M-threads (would deadlock).
   if (v8_goroutine_thread) {
     Isolate* real = Isolate::Current();
     DirectHandle<JSFunction> fn = args.at<JSFunction>(0);
-    // fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
-    // Reset budget to a moderate value so the interrupt fires periodically
-    // (every ~64K backward branches). This allows Safepoint() to be checked
-    // regularly. NOT INT32_MAX/2 — that would make the handler fire only once.
-    fn->raw_feedback_cell()->set_interrupt_budget(64 * 1024);
+
+    // Reset per-M interrupt budget in IsolateData (accessed via r13).
+    // Budget lives in per-M IsolateData, not in shared FeedbackCell.
+    tls_per_m_isolate_data->ResetGoroutineInterruptBudget();
 
     // Phase 2: create per-M FeedbackVector for this function.
     if (fn->has_feedback_vector()) {
@@ -403,11 +400,20 @@ Tagged<Object> BytecodeBudgetInterruptWithStackCheck(Isolate* isolate,
       v8_goroutine_create_per_m_feedback(fn->ptr(), fv.ptr());
     }
 
-    // Cooperative GC safepoint: check if main thread requested a safepoint.
-    // Without this, M-threads in tight loops never respond to
-    // SafepointRequested → main thread hangs in WaitUntilRunning.
+    // GC safepoint — directly check per-M LocalHeap (not real isolate's
+    // StackGuard, which is NOT poisoned by v8_goroutine_poison_stack_limits).
+    // LocalHeap::Safepoint() is cheap (~1ns flag check) when no GC pending;
+    // parks this M-thread when GC needs a SafepointScope.
     LocalHeap* lh = LocalHeap::Current();
-    if (lh) lh->Safepoint();
+    if (V8_LIKELY(lh != nullptr)) lh->Safepoint();
+
+    // Stack overflow check using per-M StackGuard (has correct goroutine
+    // mmap stack limit, unlike real isolate's StackGuard).
+    StackGuard* per_m_sg = tls_per_m_isolate_data->stack_guard();
+    uintptr_t sp = reinterpret_cast<uintptr_t>(&real);
+    if (V8_UNLIKELY(sp < per_m_sg->real_jslimit())) {
+      return real->StackOverflow();
+    }
 
     return ReadOnlyRoots(real).undefined_value();
   }
@@ -436,15 +442,13 @@ Tagged<Object> BytecodeBudgetInterruptWithStackCheck(Isolate* isolate,
 Tagged<Object> BytecodeBudgetInterrupt(Isolate* isolate, RuntimeArguments& args,
                                        CodeKind code_kind) {
   // GOROUTINE PATCH: Must check BEFORE HandleScope — isolate from r13 is
-  // garbage on M-threads. Reset FeedbackCell to INT32_MAX/2 so the budget
-  // interrupt doesn't re-fire on every subsequent JumpLoop.
-  // garbage on M-threads. Reset FeedbackCell to INT32_MAX/2 so the budget
-  // interrupt doesn't re-fire on every subsequent JumpLoop.
+  // garbage on M-threads.
   if (v8_goroutine_thread) {
     Isolate* real = Isolate::Current();
     DirectHandle<JSFunction> fn = args.at<JSFunction>(0);
-    // fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
-    // fn->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
+
+    // Reset per-M interrupt budget in IsolateData.
+    tls_per_m_isolate_data->ResetGoroutineInterruptBudget();
 
     // Phase 2: create per-M FeedbackVector for this function.
     if (fn->has_feedback_vector()) {
@@ -452,9 +456,10 @@ Tagged<Object> BytecodeBudgetInterrupt(Isolate* isolate, RuntimeArguments& args,
       v8_goroutine_create_per_m_feedback(fn->ptr(), fv.ptr());
     }
 
-    // Cooperative GC safepoint (see WithStackCheck variant for details).
+    // GC safepoint — check per-M LocalHeap flag. Cheap (~1ns) when no GC
+    // pending; parks this M-thread when SafepointScope is active.
     LocalHeap* lh = LocalHeap::Current();
-    if (lh) lh->Safepoint();
+    if (V8_LIKELY(lh != nullptr)) lh->Safepoint();
 
     return ReadOnlyRoots(real).undefined_value();
   }

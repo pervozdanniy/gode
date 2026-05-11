@@ -25,6 +25,7 @@ class Isolate;
 class IsolateData;
 class HandleScopeImplementer;
 class LinearAllocationArea;
+class StackGuard;
 
 // Per-M IsolateData pointer — fast TLS for hot-path dispatch in isolate.h.
 // Set by GoroutineThreadState::ActivatePState(), cleared by DeactivatePState().
@@ -75,6 +76,10 @@ class GoroutineThreadState {
   // Used by goroutine-local-heap.cc to point LocalHeap's allocator
   // at per-M IsolateData's LAB for zero-sync r13 fast path.
   static LinearAllocationArea* GetOldAllocationInfo(IsolateData* data);
+
+  // Poison a per-M StackGuard's jslimit so the next backward branch triggers
+  // HandleInterrupts → Safepoint(). Uses friend access to StackGuard.
+  static void PoisonStackLimit(StackGuard* sg);
 };
 
 }  // namespace internal

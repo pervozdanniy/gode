@@ -542,6 +542,14 @@ static thread_local PageMetadata* tls_last_lab_page_ = nullptr;
 
 bool PagedNewSpaceAllocatorPolicy::EnsureAllocation(
     int size_in_bytes, AllocationAlignment alignment, AllocationOrigin origin) {
+  // GOROUTINE PATCH: Call StartMinorMSIncrementalMarkingIfNeeded BEFORE
+  // acquiring the space mutex. This function can trigger a SafepointScope
+  // (which waits for all LocalHeaps to park). If called under the space mutex,
+  // M-threads blocked on the same mutex cannot park → deadlock.
+  if (!v8_goroutine_thread) {
+    space_heap()->StartMinorMSIncrementalMarkingIfNeeded();
+  }
+
   // GOROUTINE PATCH: unconditional mutex — both main thread and M-threads
   // share the same PagedNewSpace free-list.
   base::MutexGuard guard(space_->paged_space()->mutex());
@@ -675,13 +683,10 @@ bool PagedSpaceAllocatorPolicy::EnsureAllocation(int size_in_bytes,
                                                  AllocationAlignment alignment,
                                                  AllocationOrigin origin) {
   if (allocator_->identity() == NEW_SPACE) {
-    // GOROUTINE PATCH: M-thread allocators don't have is_main_thread() == true
-    // but they can allocate in NEW_SPACE. Only start minor incremental marking
-    // from the main thread.
-    if (allocator_->is_main_thread()) {
-      DCHECK(allocator_->is_main_thread());
-      space_heap()->StartMinorMSIncrementalMarkingIfNeeded();
-    }
+    // GOROUTINE PATCH: StartMinorMSIncrementalMarkingIfNeeded is now called
+    // BEFORE the space mutex in PagedNewSpaceAllocatorPolicy::EnsureAllocation
+    // to avoid deadlock (SafepointScope under mutex → M-threads blocked on
+    // same mutex can't park). Skip it here.
   }
   if ((allocator_->identity() != NEW_SPACE) && !allocator_->in_gc()) {
     // Start incremental marking before the actual allocation, this allows the

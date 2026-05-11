@@ -43,6 +43,13 @@ thread_local __attribute__((tls_model("initial-exec")))
 // Used in LabSyncBeforeRun() to refresh per-M roots_table_ after GC.
 static IsolateData* g_main_isolate_data = nullptr;
 
+// Global array of per-M IsolateData pointers.  Indexed by M-thread id (0-based).
+// Used by v8_goroutine_poison_stack_limits() to force M-threads into safepoints
+// by poisoning their per-M jslimit (setting it to kInterruptLimit).
+static constexpr int kMaxGoroutineMs = 256;
+static std::atomic<IsolateData*> g_per_m_isolate_data[kMaxGoroutineMs] = {};
+static std::atomic<uint32_t> g_num_active_ms{0};
+
 // ---- Accessors (called from patched V8 code) ----
 
 IsolateData* GoroutineThreadState::GetIsolateData() {
@@ -106,11 +113,9 @@ GoroutinePState* GoroutineThreadState::CreatePState(Isolate* isolate) {
   // Will be set to 1 in ActivatePState(). Main IsolateData has it as 0.
   p_data->tables_alignment_padding_[0] = 0;
 
-  // Per-M interrupt budget: initialise to a large positive value so the
-  // budget never reaches zero and BytecodeBudgetInterrupt is never triggered
-  // from goroutine M-threads. Since this field lives in the per-M IsolateData
-  // (accessed via [r13 + offset]), each M-thread has its own private copy —
-  // no cache-line sharing between M-threads even for hot JumpLoop bytecodes.
+  // Per-M interrupt budget: initialise to default so the first budget check
+  // after ~64K backward branches fires BytecodeBudgetInterrupt → Safepoint().
+  p_data->ResetGoroutineInterruptBudget();
 
   // HandleScopeImplementer: per-M instance.
   HandleScopeImplementer* hsi = new HandleScopeImplementer(isolate);
@@ -241,6 +246,10 @@ static HandleScopeImplementer* GetCurrentHSI() {
 LinearAllocationArea* GoroutineThreadState::GetOldAllocationInfo(
     IsolateData* data) {
   return &data->old_allocation_info_;
+}
+
+void GoroutineThreadState::PoisonStackLimit(StackGuard* sg) {
+  sg->thread_local_.set_jslimit(StackGuard::kInterruptLimit);
 }
 
 }  // namespace internal
@@ -466,6 +475,47 @@ void v8_goroutine_run_exit(v8::Isolate* isolate,
   // Restore M-thread OS stack limit.
   if (sg_ptr) {
     static_cast<StackGuard*>(sg_ptr)->SetStackLimit(sp - (900 * 1024));
+  }
+}
+
+// Register this M-thread's IsolateData in the global array for jslimit
+// poisoning. Called from M::ThreadLoop after v8_goroutine_gc_set_m_id.
+void v8_goroutine_register_m_isolate_data(uint32_t m_id) {
+  using namespace v8::internal;
+  if (m_id < kMaxGoroutineMs && tls_per_m_isolate_data) {
+    g_per_m_isolate_data[m_id].store(tls_per_m_isolate_data,
+                                     std::memory_order_release);
+    // Track number of active M-threads for iteration bounds.
+    uint32_t old = g_num_active_ms.load(std::memory_order_relaxed);
+    while (m_id + 1 > old) {
+      g_num_active_ms.compare_exchange_weak(old, m_id + 1,
+                                            std::memory_order_relaxed);
+    }
+  }
+}
+
+// Deregister this M-thread's IsolateData. Called before M-thread exits.
+void v8_goroutine_deregister_m_isolate_data(uint32_t m_id) {
+  using namespace v8::internal;
+  if (m_id < kMaxGoroutineMs) {
+    g_per_m_isolate_data[m_id].store(nullptr, std::memory_order_release);
+  }
+}
+
+// Poison all active M-thread jslimits: set jslimit to kInterruptLimit
+// (0xFFFFFFFFFFFFFFFE on 64-bit) so the next backward branch triggers
+// BytecodeBudgetInterruptWithStackCheck → HandleInterrupts → Safepoint().
+// Called from SetSafepointRequestedFlags() after marking all LocalHeaps.
+// Uses Relaxed_Store on jslimit_ (AtomicWord) — no lock needed.
+void v8_goroutine_poison_stack_limits() {
+  using namespace v8::internal;
+  uint32_t n = g_num_active_ms.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < n; i++) {
+    IsolateData* data = g_per_m_isolate_data[i].load(
+        std::memory_order_acquire);
+    if (!data) continue;
+    StackGuard* sg = data->stack_guard();
+    GoroutineThreadState::PoisonStackLimit(sg);
   }
 }
 
